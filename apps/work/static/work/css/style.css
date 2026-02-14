@@ -1,0 +1,430 @@
+:root {
+    --primary-color: #4f46e5;
+    --primary-hover: #4338ca;
+    --bg-color: #f3f4f6;
+    --card-bg: #ffffff;
+    --text-color: #1f2937;
+    --text-muted: #6b7280;
+    --border-color: #d1d5db;
+    --danger-color: #ef4444;
+    --danger-hover: #dc2626;
+    --success-color: #10b981;
+    --success-bg: #f0fdf4;
+    --success-border: #bbf7d0;
+    --success-hover: #059669;
+    --section-title-bg: #eff6ff;
+    --danger-bg: #fef2f2;
+    --danger-border: #fecaca;
+}
+
+/* ---------- Базовые стили ---------- */
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: var(--bg-color);
+    margin: 0;
+    padding: 20px;
+    color: var(--text-color);
+    line-height: 1.5;
+}
+
+/* Для index.html центрирование */
+body.center-content {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+}
+
+/* Для preview.html отступ снизу */
+body.preview-page {
+    padding-bottom: 100px;
+}
+
+.container {
+    background: var(--card-bg);
+    border-radius: 12px;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    width: 100%;
+}
+
+/* Контейнер для index.html */
+.container.upload-container {
+    padding: 2.5rem;
+    max-width: 700px;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Контейнер для preview.html */
+.container.preview-container {
+    max-width: 1400px;
+    margin: 0 auto;
+    background: transparent; /* В preview контейнер прозрачный, карточки белые */
+    box-shadow: none;
+}
+
+h1 {
+    font-size: 2rem;
+    margin: 0 0 1.5rem 0;
+    color: var(--text-color);
+    text-align: left;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 1rem;
+}
+
+/* ---------- Формы (Index) ---------- */
+
+.form-group {
+    margin-bottom: 1.5rem;
+    text-align: left;
+}
+
+label {
+    display: block;
+    margin-bottom: 0.4rem;
+    font-weight: 500;
+    font-size: 0.9rem;
+    color: var(--text-color);
+}
+
+input[type="text"],
+input[type="number"],
+input[type="date"],
+select,
+.form-control {
+    width: 100%;
+    padding: 0.6rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-sizing: border-box;
+    font-size: 0.95rem;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    outline: none;
+    background-color: var(--card-bg);
+    color: var(--text-color);
+}
+
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="date"]:focus,
+.form-control:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+}
+
+input[type="file"] {
+    display: block;
+    width: 100%;
+    padding: 0.5rem;
+    background: #f9fafb;
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    box-sizing: border-box;
+    font-size: 0.9rem;
+}
+
+input[type="file"]:hover {
+    background: #f0fdf4;
+    border-color: var(--primary-color);
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.checkbox-wrapper {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    margin-bottom: 1.5rem;
+    padding: 0.5rem;
+    border-radius: 6px;
+    transition: background 0.2s;
+}
+
+.checkbox-wrapper:hover {
+    background-color: #f9fafb;
+}
+
+input[type="checkbox"] {
+    width: auto;
+    margin-right: 0.75rem;
+    transform: scale(1.2);
+    accent-color: var(--primary-color);
+    cursor: pointer;
+}
+
+/* ---------- Кнопки ---------- */
+
+button.btn-primary {
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: 600;
+    width: 100%;
+    transition: background-color 0.2s;
+}
+
+button.btn-primary:hover {
+    background-color: var(--primary-hover);
+}
+
+.footer {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    display: flex;
+    justify-content: flex-end;
+}
+
+button.btn-logout {
+    background-color: transparent;
+    color: var(--danger-color);
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-weight: 500;
+}
+
+button.btn-logout:hover {
+    background-color: #fef2f2;
+    color: var(--danger-hover);
+}
+
+/* ---------- Сообщения (Alerts) ---------- */
+
+.error {
+    color: var(--danger-color);
+    background-color: var(--danger-bg);
+    padding: 0.75rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+    border: 1px solid var(--danger-border);
+}
+
+.success {
+    color: var(--success-color);
+    background-color: var(--success-bg);
+    padding: 0.75rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+    border: 1px solid var(--success-border);
+}
+
+/* ---------- Preview Page Styles ---------- */
+
+.object-container {
+    background: var(--card-bg);
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    margin-bottom: 2rem;
+    padding: 1.5rem;
+    display: flex;
+    gap: 2rem;
+    border: 1px solid var(--border-color);
+    min-height: 200px;
+}
+
+.image-container {
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    overflow: hidden;
+    background: #f3f4f6;
+    margin-bottom: 0.5rem;
+}
+
+.image-container img {
+    width: 100%;
+    max-height: 350px;
+    object-fit: contain;
+    display: block;
+}
+
+.field-with-image {
+    display: grid;
+    grid-template-columns: 350px 1fr;
+    gap: 1.5rem;
+    align-items: flex-start;
+    margin-bottom: 1rem;
+    border-bottom: 1px dashed var(--border-color);
+    padding-bottom: 1rem;
+}
+
+.form-section-group > .field-with-image:last-of-type {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+
+.field-image-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.form-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.readonly-field {
+    background-color: #f3f4f6 !important;
+    cursor: default;
+}
+
+.readonly-field:focus {
+    box-shadow: none !important;
+    border-color: var(--border-color) !important;
+}
+
+.form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 1rem;
+}
+
+.object-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+    color: var(--primary-color);
+    border-bottom: 2px solid var(--primary-color);
+    padding-bottom: 0.5rem;
+}
+
+.form-section-group {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+    background-color: var(--card-bg);
+    margin-bottom: 1.5rem;
+}
+
+.form-section-group-title {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1.5rem;
+    padding: 0.75rem;
+    border-radius: 6px;
+    background-color: var(--section-title-bg);
+    color: var(--primary-color);
+    text-align: center;
+    border: 1px solid #cce5ff;
+}
+
+.excel-source {
+    background-color: #f0fdf4;
+    border: 1px dashed #10b981;
+    color: #15803d;
+    padding: 1rem;
+    border-radius: 4px;
+    text-align: center;
+    font-size: 0.9rem;
+    min-height: 100px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-weight: 500;
+}
+
+.submit-button-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    background: var(--card-bg);
+    box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.05);
+    padding: 1rem 20px;
+    z-index: 1000;
+    text-align: center;
+    border-top: 1px solid var(--border-color);
+    box-sizing: border-box;
+}
+
+.btn-submit {
+    background-color: var(--success-color);
+    color: white;
+    border: none;
+    padding: 0.9rem 2.5rem;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1.1rem;
+    font-weight: 600;
+    transition: background-color 0.2s, transform 0.1s;
+    width: 100%;
+    box-shadow: 0 4px 6px rgba(16, 185, 129, 0.2);
+}
+
+.btn-submit:hover {
+    background-color: var(--success-hover);
+    transform: translateY(-1px);
+}
+
+.btn-submit:active {
+    transform: translateY(1px);
+}
+
+/* ---------- Адаптив ---------- */
+
+@media (max-width: 768px) {
+    body {
+        padding: 10px 10px 100px 10px;
+    }
+
+    .form-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .container.upload-container {
+        max-width: 500px;
+        padding: 1.5rem;
+    }
+    
+    h1 {
+        font-size: 1.5rem;
+    }
+
+    .object-container {
+        flex-direction: column;
+        padding: 1rem;
+        gap: 1rem;
+    }
+
+    .form-row {
+        grid-template-columns: 1fr;
+    }
+
+    .field-with-image {
+        grid-template-columns: 1fr;
+        gap: 0.5rem;
+    }
+
+    .image-container img {
+        max-height: 300px;
+    }
+
+    .btn-submit {
+        max-width: 100%;
+        padding: 0.75rem 1rem;
+        font-size: 1rem;
+    }
+
+    .submit-button-container {
+        padding: 1rem 10px;
+    }
+}

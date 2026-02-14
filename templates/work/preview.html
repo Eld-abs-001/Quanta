@@ -1,0 +1,342 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Предпросмотр данных</title>
+    <link rel="icon" href="{% static 'work/icons/icon.png' %}">
+    <link rel="stylesheet" href="{% static 'work/css/style.css' %}">
+
+    <style>
+        .btn-update-download,
+        .btn-cancel {
+            display: none;
+        }
+
+        .btn-update-download.visible,
+        .btn-cancel.visible {
+            display: inline-block;
+        }
+
+        .btn-ready.hidden {
+            display: none;
+        }
+
+        .field-input-group label {
+            font-weight: bold;
+        }
+    </style>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const form = document.querySelector('form');
+            const updateBtn = document.querySelector('.btn-update-download');
+            const cancelBtn = document.querySelector('.btn-cancel');
+            const readyBtn = document.querySelector('.btn-ready');
+            let formChanged = false;
+
+            const formInputs = form.querySelectorAll('input[type="text"], input[type="number"], input[type="date"]');
+
+            const initialValues = new Map();
+            formInputs.forEach(input => {
+                initialValues.set(input.name, input.value);
+            });
+
+            function checkFormChanged() {
+                let hasChanges = false;
+                formInputs.forEach(input => {
+                    if (input.value !== initialValues.get(input.name)) {
+                        hasChanges = true;
+                    }
+                });
+
+                if (hasChanges && !formChanged) {
+                    formChanged = true;
+                    updateBtn.classList.add('visible');
+                    cancelBtn.classList.add('visible');
+                    readyBtn.classList.add('hidden');
+                } else if (!hasChanges && formChanged) {
+                    formChanged = false;
+                    updateBtn.classList.remove('visible');
+                    cancelBtn.classList.remove('visible');
+                    readyBtn.classList.remove('hidden');
+                }
+            }
+
+            function resetForm() {
+                formInputs.forEach(input => {
+                    const initialValue = initialValues.get(input.name);
+                    input.value = initialValue;
+                });
+                checkFormChanged();
+            }
+
+            formInputs.forEach(input => {
+                input.addEventListener('input', checkFormChanged);
+                input.addEventListener('change', checkFormChanged);
+            });
+
+            if (cancelBtn) {
+                cancelBtn.addEventListener('click', function (event) {
+                    event.preventDefault();
+                    resetForm();
+                });
+            }
+
+            if (form) {
+                form.addEventListener('submit', function (event) {
+                    if (event.submitter && event.submitter.value === 'ready') {
+                        setTimeout(function () {
+                            window.location.href = '{% url "upload" %}';
+                        }, 1000);
+                    }
+                });
+            }
+        });
+    </script>
+</head>
+
+<body class="preview-page">
+    <div class="container preview-container">
+        <h1>Предпросмотр данных</h1>
+
+        {% if messages %}
+        {% for message in messages %}
+        <div class="{{ message.tags }}">
+            <strong>
+                {% if message.tags == 'success' %}
+                Успешно:
+                {% elif message.tags == 'error' %}
+                Ошибка:
+                {% else %}
+                Сообщение:
+                {% endif %}
+            </strong> {{ message }}
+        </div>
+        {% endfor %}
+        {% endif %}
+
+        <form method="post" action="{% url 'preview_submit' %}">
+            {% csrf_token %}
+
+            {% for obj in objects %}
+            <div class="object-container">
+                <div class="form-section">
+                    <div class="object-title">({{ forloop.counter }}) {{ obj.data.4 }}</div>
+
+                    {% if obj.errors %}
+                    <div class="error">
+                        <strong>Обнаружены проблемы:</strong>
+                        <ul style="margin: 0.5rem 0 0 1.5rem; padding: 0;">
+                            {% for error in obj.errors %}
+                            <li>{{ error }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+
+                    <div class="form-section-group">
+                        <div class="form-section-group-title">Данные с отсканированного документа</div>
+
+                        <div class="field-with-image">
+                            <div class="field-input-group">
+                                <label>Дата:</label>
+                                <input type="date" name="obj_{{ forloop.counter0 }}_date"
+                                    value="{{ obj.date_iso|default:'' }}" class="form-control"
+                                    data-initial-date="{{ obj.date_iso|default:'' }}">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.2 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.2 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="Марка АТС">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.2 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.2 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>Марка АТС:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_marka"
+                                    value="{{ obj.data.2|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.3 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.3 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="Гос.номер">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.3 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.3 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>Гос.номер:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_gos_number"
+                                    value="{{ obj.data.3|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.4 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.4 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="ФИО водителя">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.4 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.4 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>ФИО водителя:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_fio"
+                                    value="{{ obj.data.4|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.7 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.7 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="Кол.тон">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.7 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.7 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>Кол.тон:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_kol_ton"
+                                    value="{{ obj.data.7|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.8 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.8 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="Цена">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.8 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.8 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>Цена:</label>
+                                <input type="number" name="obj_{{ forloop.counter0 }}_price"
+                                    value="{{ obj.data.8|default:'' }}" step="0.01" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.13 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.13 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="Дата сопр.накл">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% elif obj.sources.13 %}
+                            <div class="field-image-group">
+                                <div class="excel-source">
+                                    Данные из ячейки {{ obj.sources.13 }}
+                                </div>
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>Дата сопр.накл:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_date_sopr"
+                                    value="{{ obj.data.13|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.15 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.15 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="№ сопров.накл. KZ">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>№ сопров.накл. KZ:</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_num_sopr"
+                                    value="{{ obj.data.15|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                        <div class="field-with-image">
+                            {% if obj.field_images.16 %}
+                            <div class="field-image-group">
+                                {% for img_path in obj.field_images.16 %}
+                                <div class="image-container">
+                                    <img src="{{ media_url }}{{ img_path }}" alt="№ счет факт">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% endif %}
+                            <div class="field-input-group">
+                                <label>№ счет факт (Инвойс):</label>
+                                <input type="text" name="obj_{{ forloop.counter0 }}_invoice"
+                                    value="{{ obj.data.16|default:'' }}" class="form-control">
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+
+
+            <div class="submit-button-container" style="display: flex; justify-content: center;">
+                <div style="display: flex; gap: 1rem; justify-content: center; width: 75%;">
+                    <button type="button" class="btn-submit btn-cancel" style="background-color: #6c757d;">Отменить изменения</button>
+                    <button type="submit" name="action" value="recalculate" class="btn-submit btn-update-download"
+                    style="background-color: #f0ad4e;">Обновить</button>
+                    <button type="submit" name="action" value="ready" class="btn-submit btn-ready">Готов</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</body>
+
+</html>

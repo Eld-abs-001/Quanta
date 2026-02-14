@@ -1,0 +1,24 @@
+-r base.txt
+
+# форматирование и линтеры
+black==25.1.0
+click==8.2.1
+mypy_extensions==1.1.0
+pathspec==0.12.1
+platformdirs==4.4.0
+
+# тесты
+iniconfig==2.1.0
+pluggy==1.6.0
+pytest==8.4.2
+pytest-django==4.11.1
+
+# утилиты для dev
+Pygments==2.19.2
+django-debug-toolbar==6.0.0
+django-extensions==4.1
+django-silk==5.4.3
+gprof2dot==2025.4.14
+
+# db
+dj-database-url==3.0.1

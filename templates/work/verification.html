@@ -1,0 +1,50 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="container mt-5">
+    <h2>Проверка данных</h2>
+    <div class="table-responsive">
+        <table class="table table-bordered table-striped">
+            <thead>
+                <tr>
+                    <th>Фото</th>
+                    <th>Марка АТС</th>
+                    <th>Гос.номер АТС</th>
+                    <th>ФИО Водит.</th>
+                    <th>Кол.тон</th>
+                    <th>Цена</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in results %}
+                <tr>
+                    <td>
+                        {% if row.photo_urls %}
+                        {% for photo_url in row.photo_urls %}
+                        <a href="{{ photo_url }}" target="_blank">
+                            <img src="{{ photo_url }}" alt="Фото"
+                                style="max-width: 100px; max-height: 100px; margin: 2px;">
+                        </a>
+                        {% endfor %}
+                        {% else %}
+                        Нет фото
+                        {% endif %}
+                    </td>
+                    <td>{{ row.2 }}</td>
+                    <td>{{ row.3 }}</td>
+                    <td>{{ row.4 }}</td>
+                    <td>{{ row.7 }}</td>
+                    <td>{{ row.8 }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <form action="{% url 'download_excel' %}" method="post" class="mt-3">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-success btn-lg">Готово (Скачать Excel)</button>
+        <a href="{% url 'upload' %}" class="btn btn-secondary btn-lg">Назад</a>
+    </form>
+</div>
+{% endblock %}
