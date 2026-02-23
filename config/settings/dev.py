@@ -3,7 +3,7 @@ import dj_database_url
 
 from config.settings.base import *
 from dotenv import load_dotenv
-load_dotenv() 
+load_dotenv(BASE_DIR / ".env") 
 
 SECRET_KEY = os.getenv('SECRET_KEY')
 DEBUG = True
