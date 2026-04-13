@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.pyd
+
+# Virtual environments
+venv/
+env/
+
+# SQLite database files
+*.sqlite3
+sqlite3/
+
+# Django
+*.log
+.env
+media/
+
+# Tests coverage
+.coverage
+htmlcov/
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.pytest_cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# Docker
+*.dockerfile
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Docker volumes and data
+**/tmp/
+**/data/
+
+# Node / frontend (если будешь использовать)
+node_modules/
+dist/
+build/
+
+# OS files
+# macOS
+.DS_Store
+# Windows thumbnail cache
+Thumbs.db

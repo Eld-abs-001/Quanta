@@ -1,0 +1,684 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="{% static 'work/icons/icon.png' %}">
+    <title>Загрузить данные</title>
+    <style>
+        :root {
+            --primary-color: #2d79f3;
+            --primary-hover: #1c64d4;
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-color: #1f2937;
+            --label-color: #9ca3af;
+            --border-color: #ecedec;
+            --danger-color: #ef4444;
+            --danger-bg: #fef2f2;
+            --danger-border: #fecaca;
+            --success-color: #10b981;
+            --success-bg: #f0fdf4;
+            --success-border: #bbf7d0;
+        }
+
+        html {
+            scrollbar-gutter: stable;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            margin: 0;
+            color: var(--text-color);
+            line-height: 1.5;
+            box-sizing: border-box;
+        }
+
+        body.center-content {
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .main-layout {
+            display: flex;
+            width: 100%;
+            gap: 1.5rem;
+        }
+
+        .container {
+            background: var(--card-bg);
+            border-radius: 5px;
+            box-shadow: rgba(0, 0, 0, 0.02) 0px 3px 5px, rgba(0, 0, 0, 0.05) 0px 0px 2px, rgba(0, 0, 0, 0.08) 0px 1px 4px !important;
+        }
+
+        .upload-container {
+            flex: 3;
+            display: flex;
+            flex-direction: column;
+            padding: 2.5rem;
+            position: -webkit-sticky;
+            position: sticky;
+            top: 2rem;
+            height: fit-content;
+        }
+
+        .right-column {
+            flex: 7;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .help-container {
+            padding: 2.5rem;
+        }
+
+        h1 {
+            font-size: 1.8rem;
+            margin: 0 0 2rem 0;
+            color: var(--text-color);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1rem;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            margin: 0 0 1.5rem 0;
+            color: var(--text-color);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1rem;
+        }
+
+        .accordion-item {
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .accordion-header {
+            background-color: transparent;
+            color: var(--text-color);
+            cursor: pointer;
+            padding: 18px 0;
+            width: 100%;
+            text-align: left;
+            border: none;
+            outline: none;
+            transition: 0.4s;
+            font-size: 1rem;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .accordion-header:hover,
+        .accordion-header.active {
+            color: var(--primary-color);
+        }
+
+        .accordion-header::after {
+            content: '\002B';
+            font-size: 1.2rem;
+            color: var(--label-color);
+            float: right;
+            margin-left: 5px;
+        }
+
+        .accordion-header.active::after {
+            content: "\2212";
+        }
+
+        .accordion-content {
+            padding: 0 10px;
+            background-color: white;
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+            color: #4b5563;
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .accordion-content p {
+            margin: 10px 0 20px 0;
+        }
+
+        .file-group {
+            margin-bottom: 1.5rem;
+            position: relative;
+        }
+
+        .file-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+            color: var(--label-color);
+            font-weight: 400;
+            transition: color 0.3s;
+        }
+
+        .file-group:hover label {
+            color: var(--primary-color);
+        }
+
+        input[type="file"] {
+            display: block;
+            width: 100%;
+            padding: 10px;
+            background: #f9fafb;
+            border: 1.5px dashed var(--border-color);
+            border-radius: 8px;
+            cursor: pointer;
+            box-sizing: border-box;
+            font-size: 0.9rem;
+            color: var(--text-color);
+            transition: border 0.3s, background 0.3s;
+        }
+
+        input[type="file"]:hover {
+            border-color: var(--primary-color);
+            background: #f0f8ff;
+        }
+
+        .input-field {
+            position: relative;
+            margin-bottom: 1.5rem;
+            width: 100%;
+        }
+
+        .input {
+            width: 100%;
+            height: 50px;
+            padding: 10px;
+            margin: 0.7vh 0;
+            padding-top: 10px;
+            border: 1.5px solid var(--border-color);
+            border-radius: 5px;
+            background: transparent;
+            outline: none;
+            font-size: 1rem;
+            color: var(--text-color);
+            box-sizing: border-box;
+            transition: border 0.3s ease;
+        }
+
+        .input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .input-field .label {
+            position: absolute;
+            top: 50%;
+            left: 12px;
+            transform: translateY(-50%);
+            color: var(--label-color);
+            font-size: 1rem;
+            pointer-events: none;
+            transition: all 0.3s ease;
+            background-color: transparent;
+            padding: 0 4px;
+            z-index: 1;
+        }
+
+        .input-field .input:focus~.label,
+        .input-field .input:not(:placeholder-shown)~.label {
+            top: 0;
+            transform: translateY(-50%);
+            font-size: 12px;
+            color: var(--primary-color);
+            background-color: var(--card-bg);
+            z-index: 2;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .checkbox-wrapper {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            margin-bottom: 1.5rem;
+            padding: 0.5rem 0;
+            color: var(--text-color);
+        }
+
+        .checkbox-wrapper input[type="checkbox"] {
+            margin-right: 10px;
+            width: 18px;
+            height: 18px;
+            accent-color: var(--primary-color);
+        }
+
+        button.btn-primary {
+            background: linear-gradient(180deg, #4f46e5 0%, #4338ca 100%);
+            color: white;
+            border: none;
+            padding: 0.9rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            width: 100%;
+            transition: all 0.3s;
+            box-shadow: 0 4px 6px rgba(79, 70, 229, 0.2);
+        }
+
+        .btn-logout {
+            background: none;
+            border: none;
+            color: var(--danger-color);
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .right-column .error, 
+        .right-column .success, 
+        .right-column .info, 
+        .right-column .warning {
+            padding: 1.25rem;
+            border-radius: 5px;
+            box-shadow: rgba(0, 0, 0, 0.02) 0px 3px 5px, rgba(0, 0, 0, 0.05) 0px 0px 2px, rgba(0, 0, 0, 0.08) 0px 1px 4px;
+            border-left: 5px solid; 
+        }
+
+        .error {
+            color: var(--danger-color);
+            background-color: var(--danger-bg);
+            border: 1px solid var(--danger-border);
+            border-left-color: var(--danger-color);
+        }
+
+        .success {
+            color: var(--success-color);
+            background-color: var(--success-bg);
+            border: 1px solid var(--success-border);
+            border-left-color: var(--success-color);
+        }
+
+        .message-content a {
+            color: inherit;
+            font-weight: bold;
+            text-decoration: underline;
+        }
+
+        .error-details-btn {
+            background: none;
+            border: none;
+            color: var(--primary-color); 
+            text-decoration: underline;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            padding: 0;
+            margin-left: 8px;
+            transition: color 0.2s ease;
+        }
+
+        .error-details-btn:hover {
+            color: var(--primary-hover);
+            text-decoration: none;
+        }
+
+        .error-details-btn:focus {
+            outline: none;
+        }
+
+        .error {
+            color: var(--danger-color);
+            background-color: var(--danger-bg);
+            border: 1px solid var(--danger-border);
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 0;
+            font-size: 0.9rem;
+        }
+
+        .error-technical-details {
+            display: none;
+            margin-top: 0.75rem;
+            padding: 0.75rem;
+            background-color: #fff;
+            border: 1px solid var(--danger-border);
+            border-left: 4px solid var(--danger-color);
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            color: #4b5563;
+            overflow-x: auto;
+            word-break: break-all;
+            border-radius: 4px;
+        }
+
+        .error-technical-details.show {
+            display: block;
+        }
+
+        @media (max-width: 992px) {
+            .main-layout {
+                flex-direction: column;
+            }
+
+            .upload-container {
+                position: static;
+                width: 100%;
+            }
+
+            .right-column {
+                width: 100%;
+            }
+
+            body.center-content {
+                display: block;
+                padding: 1rem;
+            }
+        }
+    </style>
+</head>
+
+<body class="center-content">
+
+    <div class="main-layout">
+
+        <div class="container upload-container">
+            <h1>Загрузить данные</h1>
+
+            <form method="post" enctype="multipart/form-data" novalidate>
+                {% csrf_token %}
+
+                <div class="file-group">
+                    <label for="{{ form.file.id_for_label }}">Выберите файл (ZIP)</label>
+                    {{ form.file }}
+                </div>
+
+                <div class="file-group">
+                    <label for="{{ form.existing_excel.id_for_label }}">Существующий Excel (необязательно)</label>
+                    {{ form.existing_excel }}
+                </div>
+
+                <hr style="border: 0; border-top: 1px solid #f3f4f6; margin: 20px 0;">
+
+                <div class="input-field">
+                    {{ form.date }}
+                    <label class="label" for="{{ form.date.id_for_label }}">{{ form.date.label }}</label>
+                </div>
+
+                <div class="input-field">
+                    {{ form.tn_ved_code }}
+                    <label class="label" for="{{ form.tn_ved_code.id_for_label }}">{{ form.tn_ved_code.label }}</label>
+                </div>
+                <div class="input-field">
+                    {{ form.bnd_code }}
+                    <label class="label" for="{{ form.bnd_code.id_for_label }}">{{ form.bnd_code.label }}</label>
+                </div>
+
+                <div class="input-field">
+                    {{ form.nds_percent }}
+                    <label class="label" for="{{ form.nds_percent.id_for_label }}">{{ form.nds_percent.label }}</label>
+                </div>
+
+                <label class="checkbox-wrapper" for="{{ form.save_photos.id_for_label }}">
+                    {{ form.save_photos }}
+                    <span>Сохранить фотографии (в media/imgs)</span>
+                </label>
+
+                <button type="submit" class="btn-primary">Загрузить и обработать</button>
+            </form>
+            
+            <div class="footer" style="margin-top: 1.5rem; text-align: right;">
+                <form action="{% url 'logout' %}" method="post" style="margin:0;">
+                    {% csrf_token %}
+                    <button type="submit" class="btn-logout">Выйти</button>
+                </form>
+            </div>
+
+        </div>
+
+        <div class="right-column">
+            {% if messages %}
+            {% for message in messages %}
+            <div class="{{ message.tags }}" data-message="{{ message }}">
+                <strong>{% if message.tags == 'success' %}Успешно:{% else %}Ошибка:{% endif %}</strong>
+                <span class="message-content">{{ message }}</span>
+            </div>
+            {% endfor %}
+            {% endif %}
+
+
+            <div class="container help-container">
+                <h2>Справочная информация</h2>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">Загрузка ZIP архива</button>
+                    <div class="accordion-content">
+                        <p><strong>Требования к архиву:</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li>Формат: <code>.zip</code></li>
+                            <li>Архив не должен быть защищен паролем.</li>
+                        </ul>
+
+                        <p><strong>Имена файлов и типы документов:</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>CMR (Основной документ):</strong> Имя файла должно состоять <strong>только из
+                                    цифр</strong> (например, <code>1.pdf</code>, <code>105.xlsx</code>).</li>
+                            <li><strong>Счет-фактуры (ЭСФ):</strong> Файлы PDF, начинающиеся с
+                                <code>эсф (без учета регистра)</code> и содержать фамилию
+                                (например, <code>ЭСФ № 8899 от 18.11.2025 Каримбаев Э.pdf</code>).
+                            </li>
+                            <li><strong>Накладные (СНТ):</strong> Файлы PDF, начинающиеся с
+                                <code>снт (без учета регистра)</code> и содержать фамилию (например,
+                                <code>СНТ № 8498 от 18.11.2025 Бурлибаев Б.pdf</code>).
+                            </li>
+                        </ul>
+
+                        <p><strong>Если CMR в формате Excel (.xlsx):</strong></p>
+                        <p style="margin-bottom: 5px;">Убедитесь, что данные находятся в следующих ячейках:</p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>Дата:</strong> <code>K75</code> или <code>K76</code>.</li>
+                            <li><strong>ФИО Водителя:</strong> <code>M80</code>.</li>
+                            <li><strong>Марка авто:</strong> <code>G89</code>.</li>
+                            <li><strong>Гос. номер:</strong> <code>B89</code> и <code>B90</code>.</li>
+                            <li><strong>Вес:</strong> <code>U43</code>.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">Существующий Excel (Дополнительно)</button>
+                    <div class="accordion-content">
+                        <p><strong>Назначение:</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li>Загрузите этот файл, если хотите дополнить уже существующую таблицу новыми данными из
+                                ZIP архива.</li>
+                            <li>Новые строки будут добавлены в конец этого файла.</li>
+                            <li>Принимаемые форматы: <code>.xlsx</code>, <code>.xlsm</code>, <code>.xltx</code>,
+                                <code>.xltm</code>.
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">Дата</button>
+                    <div class="accordion-content">
+                        <p><strong>Укажите дату пересечения границы.</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>Формат:</strong> <code>ДД.ММ.ГГГГ</code>.</li>
+                            <li><strong>Назначение:</strong> Используется для получения курса доллара США с сайта НБКР.
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">Код ТН ВЭД</button>
+                    <div class="accordion-content">
+                        <p><strong>Товарная номенклатура внешнеэкономической деятельности</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>Формат:</strong> Число состаящий из 8 цифр (без пробелов).</li>
+                            <li><strong>По умолчанию:</strong> {{ form.tn_ved_code.value }}</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">БНД</button>
+                    <div class="accordion-content">
+                        <p><strong>Нефтяного дорожного битума</strong></p>
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>По умолчанию:</strong> {{ form.bnd_code.value }}</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="accordion-item">
+                    <button class="accordion-header">НДС ЕАЭС (%)</button>
+                    <div class="accordion-content">
+                        <ul style="margin-top: 5px; margin-bottom: 15px; padding-left: 20px;">
+                            <li><strong>Формат:</strong> Укажите только число (например, <code>12,0</code> или
+                                <code>20,0</code>).
+                            </li>
+                            <li><strong>Важно:</strong> Не используйте знак <code>%</code>.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div class="container help-container" style="padding: 1.5rem; flex: 1;">
+                <div style="
+                    display: grid; 
+                    grid-template-columns: repeat(4, 1fr); 
+                    gap: 1rem; 
+                    overflow-x: auto;
+                    flex-grow: 1;
+                    height: 100%;
+                ">
+                    <div style="display: flex; flex-direction: column; min-width: 220px;">
+                        <div style="height: 50px; display: flex; align-items: center; justify-content: center; text-align: center;">
+                            <p style="margin: 0; font-size: 0.95rem; font-weight: 600; color: var(--text-color);">Выбрать ZIP архив</p>
+                        </div>
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background: #fff;">
+                            <img src="{% static 'work/images/img_1.png' %}" alt="Step 1"
+                                style="width: 100%; display: block; object-fit: contain;">
+                        </div>
+                    </div>
+
+                    <div style="display: flex; flex-direction: column; min-width: 220px;">
+                        <div style="height: 50px; display: flex; align-items: center; justify-content: center; text-align: center;">
+                            <p style="margin: 0; font-size: 0.95rem; font-weight: 600; color: var(--text-color);">Выбрать Excel (необязательно)</p>
+                        </div>
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background: #fff;">
+                            <img src="{% static 'work/images/img_2.png' %}" alt="Step 2"
+                                style="width: 100%; display: block; object-fit: contain;">
+                        </div>
+                    </div>
+
+                    <div style="display: flex; flex-direction: column; min-width: 220px;">
+                        <div style="height: 50px; display: flex; align-items: center; justify-content: center; text-align: center;">
+                            <p style="margin: 0; font-size: 0.95rem; font-weight: 600; color: var(--text-color);">Выбрать дату (необязательно)</p>
+                        </div>
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background: #fff;">
+                            <img src="{% static 'work/images/img_3.png' %}" alt="Step 3"
+                                style="width: 100%; display: block; object-fit: contain;">
+                        </div>
+                    </div>
+
+                    <div style="display: flex; flex-direction: column; min-width: 220px;">
+                        <div style="height: 50px; display: flex; align-items: center; justify-content: center; text-align: center;">
+                            <p style="margin: 0; font-size: 0.95rem; font-weight: 600; color: var(--text-color);">Нажать загрузить и готово</p>
+                        </div>
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background: #fff;">
+                            <img src="{% static 'work/images/img_4.png' %}" alt="Step 4"
+                                style="width: 100%; display: block; object-fit: contain;">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const floatingInputs = document.querySelectorAll('.input-field input, .input-field select');
+        floatingInputs.forEach(input => {
+            input.classList.add('input');
+            if (!input.getAttribute('placeholder')) {
+                input.setAttribute('placeholder', ' ');
+            }
+        });
+
+        document.addEventListener('DOMContentLoaded', function () {
+            const messageContainers = document.querySelectorAll('[data-message]');
+            messageContainers.forEach(function (container) {
+                const fullMessage = container.getAttribute('data-message');
+                if (fullMessage.includes('|||')) {
+                    const parts = fullMessage.split('|||');
+                    const contentSpan = container.querySelector('.message-content');
+                    contentSpan.textContent = parts[0];
+
+                    const detailsBtn = document.createElement('button');
+                    detailsBtn.type = 'button';
+                    detailsBtn.className = 'error-details-btn';
+                    detailsBtn.textContent = 'Подробнее';
+                    detailsBtn.onclick = function () { toggleDetails(this); };
+                    contentSpan.appendChild(detailsBtn);
+
+                    const detailsDiv = document.createElement('div');
+                    detailsDiv.className = 'error-technical-details';
+                    detailsDiv.textContent = parts[1];
+                    container.appendChild(detailsDiv);
+                }
+            });
+        });
+
+        function toggleDetails(button) {
+            const container = button.closest('[data-message]');
+            const detailsDiv = container.querySelector('.error-technical-details');
+            if (detailsDiv.classList.contains('show')) {
+                detailsDiv.classList.remove('show');
+                button.textContent = 'Подробнее';
+            } else {
+                detailsDiv.classList.add('show');
+                button.textContent = 'Скрыть';
+            }
+        }
+
+        var acc = document.getElementsByClassName("accordion-header");
+        for (var i = 0; i < acc.length; i++) {
+            acc[i].addEventListener("click", function () {
+                this.classList.toggle("active");
+                var panel = this.nextElementSibling;
+                if (panel.style.maxHeight) {
+                    panel.style.maxHeight = null;
+                } else {
+                    panel.style.maxHeight = panel.scrollHeight + "px";
+                }
+            });
+        }
+
+        const mainForm = document.querySelector('form[method="post"][enctype]');
+        if (mainForm) {
+            mainForm.addEventListener('submit', function (event) {
+                const submitButton = event.submitter;
+                if (submitButton && submitButton.classList.contains('btn-logout')) {
+                    return;
+                }
+                
+                const dateInput = mainForm.querySelector('input[name="date"]');
+                if (dateInput && !dateInput.value) {
+                    const message = "Дата не указана.\n\nБез неё:\n1. курс валюты не будет получен;\n2. сумма в сомах и НДС ЕАЭС не будут рассчитаны.\n\nПродолжить?";
+                    if (!confirm(message)) {
+                        event.preventDefault();
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+
+</html>
