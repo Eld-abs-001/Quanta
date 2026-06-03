@@ -1,16 +1,19 @@
 import os
 import zipfile
 import shutil
+import tempfile
+from contextlib import contextmanager
 import re
 import math
 import hashlib
-import fitz # PyMuPDF
+import fitz 
 import easyocr
-import cv2 # OpenCV для обработки изображений
+import cv2 
 import numpy as np
 from PIL import Image
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from datetime import datetime
+from time import perf_counter
 import openpyxl
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning) # Suppress torch/easyocr warnings
@@ -20,6 +23,423 @@ import requests
 from bs4 import BeautifulSoup
 from django.conf import settings
 import difflib # For fuzzy matching
+
+PLATE_TOKEN_RE = re.compile(r"^\d{2,4}[A-Z]{2,4}\d{2,4}$")
+
+# Поля с фото на странице предпросмотра (ключи — как в Excel/форме)
+PREVIEW_PHOTO_FIELD_KEYS = frozenset({1, 2, 3, 4, 7, 8})
+
+
+def cleanup_preview_workspace(workspace_dir):
+    """Удаляет временную папку OCR (системный temp, не media)."""
+    if not workspace_dir:
+        return
+    try:
+        if os.path.isdir(workspace_dir):
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+            print(f"[cleanup_preview_workspace] Удалено: {workspace_dir}")
+    except Exception as e:
+        print(f"[cleanup_preview_workspace] Ошибка: {workspace_dir}: {e}")
+
+
+def _cleanup_ocr_processing_artifacts(workspace_dir):
+    """После OCR удаляет zip и распаковку; кропы и preview_imgs остаются до скачивания Excel."""
+    if not workspace_dir or not os.path.isdir(workspace_dir):
+        return
+    for name in ("upload", "extracted"):
+        path = os.path.join(workspace_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    try:
+        for item in os.listdir(workspace_dir):
+            if item.startswith("temp_imgs_processing_obj_"):
+                shutil.rmtree(os.path.join(workspace_dir, item), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _preview_relpath(abs_path, workspace_dir):
+    rel = os.path.relpath(abs_path, workspace_dir)
+    return rel.replace("\\", "/")
+
+
+PREVIEW_JPEG_QUALITY = 92
+
+
+def _pil_rgb_to_bgr_np(pil_img):
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def _easyocr_read_pil(pil_img, ocr_reader=None, allowlist=None):
+    """OCR по PIL-изображению в памяти (без записи на диск)."""
+    active = ocr_reader or reader
+    if active is None:
+        return []
+    ocr_np = _pil_rgb_to_bgr_np(pil_img)
+    try:
+        if allowlist:
+            return active.readtext(ocr_np, detail=1, allowlist=allowlist)
+        return active.readtext(ocr_np, detail=1)
+    except TypeError:
+        return active.readtext(ocr_np, detail=1)
+
+
+def _save_preview_jpeg(pil_img, path):
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    pil_img.save(path, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
+
+
+def _preview_field_key(field_name: str):
+    """Ключ поля (1–8) для предпросмотра по имени поля в карте координат."""
+    if not field_name or "Якорь" in field_name or "Anchor" in field_name:
+        return None
+    if "Дата (1)" in field_name or field_name.strip().startswith("Дата"):
+        return 1
+    if "Марка" in field_name and "Гос" not in field_name:
+        return 2
+    if "Гос_номер" in field_name:
+        return 3
+    if "ФИО Водит" in field_name:
+        return 4
+    if "Кол.тон" in field_name:
+        return 7
+    if "Цена (8)" in field_name or field_name.strip().startswith("Цена"):
+        return 8
+    return None
+
+
+def _is_preview_photo_field(field_name: str) -> bool:
+    return _preview_field_key(field_name) is not None
+
+
+def _field_key_from_image_name(img_file_lower):
+    """Определяет ключ поля по транслитерированному имени JPEG (фоллбек для scan_dir)."""
+    if "data_1" in img_file_lower or (
+        ("date" in img_file_lower or "data" in img_file_lower) and "_1" in img_file_lower
+    ):
+        return 1
+    if (("marka" in img_file_lower or "марка" in img_file_lower) and
+            "gos" not in img_file_lower and "nomer" not in img_file_lower):
+        return 2
+    if ("gos" in img_file_lower and "nomer" in img_file_lower):
+        return 3
+    if "fio" in img_file_lower and "vodit" in img_file_lower:
+        return 4
+    if "kol" in img_file_lower and "ton" in img_file_lower:
+        return 7
+    if ("cena" in img_file_lower or "tsena" in img_file_lower or
+            "_8" in img_file_lower or "(8)" in img_file_lower):
+        return 8
+    return None
+
+
+def _merge_preview_paths_from_extract(field_images, extracted_data):
+    """Добавляет пути кропов из extract_text_from_pdf (надёжнее, чем угадывание по имени файла)."""
+    by_field = extracted_data.get("_preview_by_field")
+    if not isinstance(by_field, dict):
+        return
+    for key_str, paths in by_field.items():
+        try:
+            field_key = int(key_str)
+        except (TypeError, ValueError):
+            continue
+        if field_key not in PREVIEW_PHOTO_FIELD_KEYS:
+            continue
+        bucket = field_images.setdefault(str(field_key), [])
+        for rel_path in paths:
+            if rel_path and rel_path not in bucket:
+                bucket.append(rel_path)
+
+
+def _scan_dir_field_images(scan_dir, workspace_root, field_images, preview_paths=None):
+    """Фоллбек: классифицирует JPEG в field_images (строковые ключи «1»…«8»)."""
+    if not scan_dir or not os.path.isdir(scan_dir):
+        return
+    for img_file in os.listdir(scan_dir):
+        img_path = os.path.join(scan_dir, img_file)
+        if not os.path.isfile(img_path):
+            continue
+        lower = img_file.lower()
+        if not lower.endswith((".jpg", ".jpeg", ".png")):
+            continue
+        rel_path = _preview_relpath(img_path, workspace_root)
+        field_key = _field_key_from_image_name(lower)
+        if field_key not in PREVIEW_PHOTO_FIELD_KEYS:
+            continue
+        if preview_paths is not None:
+            preview_paths.append(rel_path)
+        bucket = field_images.setdefault(str(field_key), [])
+        if rel_path not in bucket:
+            bucket.append(rel_path)
+
+
+@contextmanager
+def _ocr_temp_workspace():
+    """Временная папка в системном temp; при ошибке OCR удаляется целиком."""
+    path = tempfile.mkdtemp(prefix="quanta_ocr_")
+    print(f"[ocr_temp_workspace] Создано: {path}")
+    try:
+        yield path
+    except Exception:
+        cleanup_preview_workspace(path)
+        raise
+
+
+class _TimingCollector:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._next_block_id = 1
+        self.blocks = []
+
+    def start_block(self, title: str):
+        if not self.enabled:
+            return None
+        block = {
+            "block_id": self._next_block_id,
+            "title": title,
+            "steps": [],
+            "total_seconds": None,
+        }
+        self._next_block_id += 1
+        self.blocks.append(block)
+        return block
+
+    def set_block_total(self, block, seconds: float):
+        if not block:
+            return
+        block["total_seconds"] = seconds
+
+    def add_step(self, block, idx: int, description: str, seconds: float):
+        if not block:
+            return
+        block["steps"].append(
+            {
+                "idx": idx,
+                "description": description,
+                "seconds": seconds,
+            }
+        )
+
+    def print_all(self, overall_seconds=None):
+        if not self.enabled:
+            return
+        for block in self.blocks:
+            block_id = block["block_id"]
+            print(f"=========Работа с файлом: {block_id}=========")
+            for step in block["steps"]:
+                print(f"====={step['idx']}={step['description']}")
+                print(f"={step['seconds']:.3f} секунд")
+        if overall_seconds is not None:
+            print(f"=========ИТОГО: {overall_seconds:.3f} секунд=========")
+
+
+def _format_word_groups(groups, empty_label="    (пусто)"):
+    """Форматирует список (текст, высота) или ocr_debug-записей для лога."""
+    if not groups:
+        return empty_label
+    lines = []
+    for item in groups:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            text, h = item[0], item[1]
+            extra = ""
+            if len(item) >= 3:
+                extra = f", уверенность={item[2]:.2f}"
+            lines.append(f"    «{text}» — высота букв H={h}px{extra}")
+        elif isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+            h = item.get("height", "?")
+            passed = item.get("passed")
+            mark = "✓" if passed else "✗"
+            lines.append(f"    «{text}» — H={h}px, min={item.get('min_height', '?')} [{mark}]")
+        elif item:
+            lines.append(f"    «{item}»")
+    return "\n".join(lines) if lines else empty_label
+
+
+def _brand_cleaning_desc():
+    return (
+        "канал B (синий) из RGB\n"
+        "бинаризация: нет\n"
+        "отбор строк: 35 < высота букв H < 46 px (get_cleaned_big_3_list)\n"
+        "склейка результата: через « / »"
+    )
+
+
+def _fio_cleaning_desc(threshold):
+    min_h = CURRENT_MIN_HEIGHT_CONFIG.get("ФИО Водит. (4)", 0)
+    return (
+        f"канал B (синий) из RGB\n"
+        f"бинаризация: порог {threshold} (пиксель > {threshold} → белый, иначе чёрный)\n"
+        f"отбор ФИО: 35 < H < 500 px; min_height OCR-фильтра: {min_h}\n"
+        "правила: не более 2 точек, без мусорных символов, фамилия ≥ 3 букв"
+    )
+
+
+def _plate_cleaning_header(threshold_options, min_height_plate):
+    return (
+        "канал B (синий) из RGB → серая матрица\n"
+        f"список порогов бинаризации: {threshold_options}\n"
+        f"пайплайны: raw, raw_x2, clahe, clahe_x2, adaptive_gauss_31_7, otsu, thr_<N>, clahe_thr_<N>\n"
+        f"OCR: EasyOCR (en), allowlist A-Z0-9/\n"
+        f"min_height для номера: {min_height_plate}px\n"
+        "остановка: как только найдено ≥ 2 токена формата номера"
+    )
+
+
+def _record_field_attempt(extracted_data, field_name, entry):
+    extracted_data.setdefault("_field_logs", {}).setdefault(field_name, {"attempts": []})
+    attempts = extracted_data["_field_logs"][field_name]["attempts"]
+    if "attempt" not in entry:
+        entry["attempt"] = len(attempts) + 1
+    attempts.append(entry)
+
+
+def _merge_field_logs(target, source):
+    if not isinstance(source, dict):
+        return
+    for field_name, block in source.items():
+        if not isinstance(block, dict):
+            continue
+        target.setdefault(field_name, {"attempts": []})
+        for att in block.get("attempts") or []:
+            if isinstance(att, dict):
+                target[field_name]["attempts"].append(dict(att))
+
+
+def format_driver_ocr_details(
+    file_label,
+    field_logs,
+    fio_meta_attempts=None,
+    final_brand="",
+    final_plate="",
+    final_fio="",
+    chosen_fio_attempt=None,
+):
+    """Текстовый отчёт по распознаванию полей одного водителя (для print и ошибок)."""
+    lines = [
+        "",
+        "=" * 35,
+        "Детали",
+        "=" * 35,
+        f"Файл: {file_label}",
+        "",
+    ]
+
+    # --- Марка ---
+    lines.append("===Марка АТС===")
+    brand_attempts = (field_logs or {}).get("Марка", {}).get("attempts") or []
+    if not brand_attempts:
+        lines.append("(полный OCR не выполнялся или данные из XLSX)")
+    else:
+        lines.append(f"Всего попыток OCR: {len(brand_attempts)} (марка перечитывается только при полном OCR страницы)")
+        for att in brand_attempts:
+            lines.append(f"=попытка: {att.get('attempt', '?')}")
+            if att.get("ocr_mode"):
+                lines.append(f"режим: {att['ocr_mode']}")
+            lines.append("Взято группа слов (все распознанные, с высотой букв):")
+            lines.append(_format_word_groups(att.get("raw_groups")))
+            if att.get("filtered_groups") is not None:
+                lines.append("После фильтра 35<H<46:")
+                lines.append(_format_word_groups([(t, "") for t in att.get("filtered_groups") or []] or None))
+            lines.append("Настройка для очистки:")
+            lines.append(att.get("cleaning") or _brand_cleaning_desc())
+            if att.get("result"):
+                lines.append(f"Итог попытки: {att['result']}")
+            lines.append("")
+    if final_brand:
+        lines.append(f"→ Итоговая марка: {final_brand}")
+    lines.append("")
+
+    # --- Гос.номер ---
+    lines.append("===Гос.номер===")
+    plate_key = "Гос_номер ()"
+    plate_block = (field_logs or {}).get(plate_key, {})
+    plate_attempts = plate_block.get("attempts") or []
+    if not plate_attempts:
+        lines.append("(нет данных OCR)")
+    else:
+        if plate_block.get("cleaning_header"):
+            lines.append("Общие настройки пайплайна:")
+            lines.append(plate_block["cleaning_header"])
+            lines.append("")
+        chosen = plate_block.get("chosen_attempt")
+        lines.append(f"Всего внутренних попыток (пайплайн×порог): {len(plate_attempts)}")
+        for att in plate_attempts:
+            mark = " ← ВЫБРАНО" if att.get("attempt") == chosen else ""
+            if att.get("selected"):
+                mark = " ← ВЫБРАНО"
+            lines.append(f"=попытка: {att.get('attempt', '?')}{mark}")
+            lines.append(f"пайплайн: {att.get('pipeline', '?')}")
+            if att.get("threshold") is not None:
+                lines.append(f"порог бинаризации: {att['threshold']}")
+            lines.append(f"оценка: {att.get('score', '?')}, совпадений формата: {att.get('matches', '?')}")
+            lines.append("Взято группа слов:")
+            lines.append(_format_word_groups(att.get("raw_groups")))
+            lines.append("")
+        if plate_block.get("winning_pipeline"):
+            lines.append(
+                f"Выбран пайплайн: {plate_block.get('winning_pipeline')}, "
+                f"порог: {plate_block.get('winning_threshold')}"
+            )
+        if plate_block.get("retry_failed"):
+            lines.append("(ни одна попытка не дала 2 валидных части номера — взят лучший по score)")
+    if final_plate:
+        lines.append(f"→ Итоговый гос.номер: {final_plate}")
+    lines.append("")
+
+    # --- ФИО ---
+    lines.append("===ФИО водителя===")
+    fio_key = "ФИО Водит. (4)"
+    fio_attempts = (field_logs or {}).get(fio_key, {}).get("attempts") or []
+    fio_meta = fio_meta_attempts or []
+    if not fio_attempts and not fio_meta:
+        lines.append("(нет данных OCR)")
+    else:
+        total = max(len(fio_attempts), len(fio_meta))
+        lines.append(
+            f"Всего попыток с разным порогом очистки: {total} "
+            f"(пороги: первая — полный OCR, далее — только поле ФИО по кэшу страницы)"
+        )
+        for i in range(total):
+            att = fio_attempts[i] if i < len(fio_attempts) else {}
+            meta = fio_meta[i] if i < len(fio_meta) else {}
+            num = meta.get("attempt") or att.get("attempt") or (i + 1)
+            chosen_mark = ""
+            if chosen_fio_attempt is not None and num == chosen_fio_attempt:
+                chosen_mark = " ← ИТОГ"
+            lines.append(f"=попытка: {num}{chosen_mark}")
+            if meta.get("mode"):
+                lines.append(f"режим: {meta['mode']}")
+            thresh = meta.get("threshold") or att.get("threshold")
+            if thresh is not None:
+                lines.append(f"порог очистки фото: {thresh}")
+            lines.append("Взято группа слов (текст + высота букв H в px):")
+            raw = att.get("raw_groups")
+            if raw is None and meta.get("raw_groups"):
+                raw = meta["raw_groups"]
+            lines.append(_format_word_groups(raw))
+            if meta.get("fio_clean") is not None:
+                lines.append(f"После clean_fio_raw: «{meta.get('fio_clean', '')}»")
+            if meta:
+                rules = "да" if meta.get("rules_passed") else "нет"
+                lines.append(f"правила ФИО: {rules}")
+                if meta.get("rules_fail_reason"):
+                    lines.append(f"причина отказа: {meta['rules_fail_reason']}")
+                if meta.get("t2_match") or meta.get("t3_match"):
+                    lines.append("совпадение с файлом ЭСФ/СНТ: да")
+                elif meta.get("rules_passed"):
+                    lines.append("совпадение с файлом ЭСФ/СНТ: нет (продолжаем перебор)")
+            lines.append("Настройки для очистки:")
+            lines.append(att.get("cleaning") or _fio_cleaning_desc(thresh or "?"))
+            lines.append("")
+    if final_fio:
+        lines.append(f"→ Итоговое ФИО: {final_fio}")
+    lines.append("=" * 35)
+    return "\n".join(lines)
+
 
 class NetworkError(Exception):
     def __init__(self, user_message, technical_details):
@@ -78,14 +498,43 @@ def get_current_dollar_rate(date_str=None):
     else:
         print(f"[get_current_dollar_rate] rate not found for date {date_str}")
         raise Exception(f"Не удалось найти курс на дату {date_str}")
+# Настройки авто-замены для Марки АТС
+# if_have (если в тексте есть это слово -> заменить всю строку на указанное значение)
+BRAND_CONTAIN_MAP = {
+    "scania": "Scania",
+    "volvo": "Volvo",
+}
 
+# if_it (точечная замена подстроки для исправления опечаток в буквах)
+BRAND_SUBSTRING_MAP = {
+    r'(?i)(?<!v)olvo': 'Volvo',
+    r'(?i).*olvo.*': 'Volvo',
+    r'(?i).*scania.*': 'Scania',
+}
+
+def clean_brand_name(brand_text):
+    if not brand_text:
+        return brand_text
+    
+    # 1. Точечная замена подстрок (if_it)
+    for pattern, replacement in BRAND_SUBSTRING_MAP.items():
+        brand_text = re.sub(pattern, replacement, brand_text)
+        
+    # 2. Поиск ключевых слов для замены всей строки (if_have)
+    brand_text_lower = brand_text.lower()
+    for key, replacement in BRAND_CONTAIN_MAP.items():
+        if key in brand_text_lower:
+            return replacement
+            
+    return brand_text.strip()
+
+# 2026
 FIELDS_MAP_TYPE_1 = {
-    "Дата (1)": (880, 2485, 390, 140),
-    "ФИО Водит. (4)": (850, 2395, 500, 150),
-    "Кол.тон (7)": (1470, 1355, 300, 80),
-    "Марка": (350, 2655, 350, 70),
-    "Гос_номер ()": (-80, 2645, 700, 170), 
-    "Якорь (1)": (0, 500, 500, 1000), # Anchor for alignment
+    "ФИО Водит. (4)": (850, 2305, 500, 150),
+    "Кол.тон (7)": (1470, 1275, 300, 200),
+    "Марка": (350, 2575, 350, 120),
+    "Гос_номер ()": (-80, 2580, 600, 200),
+    "Якорь (1)": (0, 0, 400, 500),
 }
 
 FIELDS_MAP_TYPE_2 = {
@@ -109,12 +558,11 @@ MIN_HEIGHT_CONFIG = {
 CURRENT_MIN_HEIGHT_CONFIG = MIN_HEIGHT_CONFIG
 
 LEGACY_FIELDS_MAP_TYPE_1 = {
-    "Дата (1)": (880, 2520, 390, 140),
     "ФИО Водит. (4)": (850, 2450, 500, 150),
     "Кол.тон (7)": (1500, 1390, 300, 80),
     "Марка": (380, 2730, 350, 70),
     "Гос_номер ()": (-80, 2730, 700, 170),
-    "Якорь (1)": (0, 500, 500, 1000), # Anchor for alignment
+    "Якорь (1)": (0, 0, 500, 1000),
 }
 
 LEGACY_FIELDS_MAP_TYPE_2 = {
@@ -166,22 +614,61 @@ def get_maps_by_zip_name(zip_filename):
     }
 
 try:
-    reader = easyocr.Reader(["ru", "en"], gpu=False)
+    # Main OCR reader (ru/en + optional kk for Kazakh)
+    try:
+        reader = easyocr.Reader(["ru", "en", "kk"], gpu=False)
+    except Exception as e_kk:
+        print(f"EasyOCR init without kk (fallback ru/en). reason={e_kk}")
+        reader = easyocr.Reader(["ru", "en"], gpu=False)
 except Exception as e:
     print(f"Error initializing EasyOCR: {e}")
     reader = None
 
+try:
+    # Plate-specific reader: English only (less confusion with Cyrillic)
+    plate_reader = easyocr.Reader(["en"], gpu=False)
+except Exception as e:
+    print(f"Error initializing plate EasyOCR reader: {e}")
+    plate_reader = None
+
 def deskew_image(img_cv):
     try:
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        # Оптимизация скорости:
+        # Canny/Hough считаются по полному изображению и на листах dpi=300 это очень тяжело.
+        # Детектируем угол на уменьшенной копии, а потом поворачиваем исходное изображение.
+        h, w = img_cv.shape[:2]
+        scale = 1.0
+        max_dim = max(h, w)
+        if max_dim > 2000:
+            scale = 0.5
+        if scale != 1.0:
+            img_small = cv2.resize(
+                img_cv,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            img_small = img_cv
 
+        gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150, apertureSize=3)
 
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
+        min_line_len = max(10, int(100 * scale))
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=100,
+            minLineLength=min_line_len,
+            maxLineGap=10,
+        )
 
         angles = []
         if lines is not None:
-            for line in lines:
+            # Ограничиваем количество линий для ускорения
+            for i, line in enumerate(lines):
+                if i >= 200:
+                    break
                 x1, y1, x2, y2 = line[0]
 
                 angle_rad = math.atan2(y2 - y1, x2 - x1)
@@ -223,6 +710,8 @@ def deskew_image(img_cv):
         return img_cv
 
 class DataCleaner:
+    FIO_DISALLOWED_CHARS = set('()=-+!"№;%:?*/\\":?><,\'0123456789')
+
     @staticmethod
     def replace_ruble(text):
         if not text:
@@ -231,9 +720,10 @@ class DataCleaner:
 
     @staticmethod
     def clean_1(text, context):
-        match = re.search(r'\b(\d{2}\.\d{2}\.\d{4})\b', text)
-        if match:
-            return match.group(1)
+        if text:
+            match = re.search(r'\b(\d{2}\.\d{2}\.\d{4})\b', text)
+            if match:
+                return match.group(1)
 
         surname = context.get('surname')
         if surname:
@@ -259,7 +749,7 @@ class DataCleaner:
 
         filtered = []
         for text, h in data:
-            if 35 < h < 46:
+            if 35 < h < 55:
                 filtered.append(text.strip())
 
         while filtered and filtered[0] in ["25", "26", "27", "28", "29", "30"]:
@@ -288,6 +778,26 @@ class DataCleaner:
         t = re.sub(r'[^A-Z0-9/]', '', t)
         
         return t
+
+    @staticmethod
+    def is_plate_token_like(token: str) -> bool:
+        if not token:
+            return False
+        cleaned = DataCleaner.clean_plate_text(token)
+        return bool(PLATE_TOKEN_RE.match(cleaned))
+
+    @staticmethod
+    def is_plate_result_like(raw_items) -> bool:
+        """
+        raw_items: list[tuple[text, height]] (already height-filtered for plate field)
+        Returns True if at least one token looks like a plate.
+        """
+        if not isinstance(raw_items, list):
+            return False
+        for text, _h in raw_items:
+            if DataCleaner.is_plate_token_like(str(text)):
+                return True
+        return False
 
     @staticmethod
     def clean_2(data, context): return ""
@@ -327,6 +837,39 @@ class DataCleaner:
             return t, t
             
         return "", ""
+
+    @staticmethod
+    def fio_rules_ok(fio_text: str) -> bool:
+        """
+        Проверка распознанного ФИО по правилам:
+        - не более 2 точек (например, И.И. в середине + финальная точка не должны "разрастаться")
+        - не должны встречаться "мусорные" символы из заданного списка
+        """
+        if fio_text is None:
+            return False
+        t = str(fio_text)
+        if not t.strip():
+            return False
+
+        if t.count(".") > 2:
+            return False
+
+        if any(ch in t for ch in DataCleaner.FIO_DISALLOWED_CHARS):
+            return False
+
+        # Часто OCR "подхватывает" текст со штампа/печати.
+        # В таких случаях первая "фамилия" бывает очень короткой (например, "ТО").
+        # Это мешает матчить по файлам, поэтому отбрасываем слишком короткое первое слово.
+        words = [w for w in re.split(r"\s+", t.strip()) if w]
+        if words:
+            first = words[0]
+            # Оставляем только буквы/точки как в sanitize_surname
+            first_clean = re.sub(r"[^A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүІі\.]", "", first)
+            first_clean = first_clean.replace(".", "")
+            if len(first_clean) < 3:
+                return False
+
+        return True
 
     @staticmethod
     def clean_4(text, context): return text.strip("'") if text else text
@@ -489,7 +1032,7 @@ def get_safe_filename(original_name, field_name):
     safe_field = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_field)
     safe_field = re.sub(r'_+', '_', safe_field).strip('_')
     
-    return f"{safe_base}_{hash_hex}_{safe_field}.png"
+    return f"{safe_base}_{hash_hex}_{safe_field}.jpg"
 
 def extract_name_from_filename(filename):
     base = os.path.splitext(os.path.basename(filename))[0]
@@ -497,35 +1040,142 @@ def extract_name_from_filename(filename):
     base = base.replace('_', ' ').strip()
     return base
 
-def extract_text_from_pdf(pdf_path, coords_map, save_dir, apply_deskew=False, page_num=0, fio_threshold=170):
+def extract_surname_from_filename(filename):
+    base = os.path.splitext(os.path.basename(filename))[0]
+    base = base.replace('_', ' ').strip()
+    words = [w for w in re.split(r'\s+', base) if w]
+    if words:
+        last_word = words[-1]
+        cleaned = re.sub(r'[^A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүІі-]', '', last_word)
+        if len(cleaned) >= 3:
+            return cleaned
+    return None
+
+def extract_text_from_pdf(
+    pdf_path,
+    coords_map,
+    save_dir,
+    apply_deskew=False,
+    page_num=0,
+    fio_threshold=170,
+    page_cache_holder=None,
+    page_cache_image=None,
+    anchor_offset_cached=None,
+    timing_collector=None,
+    extract_mode_label=None,
+    save_preview_files=True,
+    preview_workspace_root=None,
+):
+    """
+    Извлекает поля по координатам с первой страницы PDF (или с кэшированного изображения страницы).
+
+    Для повторных попыток ФИО: page_cache_image или page_cache_holder['image'] (RAM, без PNG на диск).
+    OCR полей — из памяти; JPEG на диск только для предпросмотра (save_preview_files).
+    """
     extracted_data = {}
+    extracted_data["ocr_debug"] = {}
+    extracted_data["_field_logs"] = {}
+    doc = None
+    timing_block = timing_collector.start_block(os.path.basename(pdf_path)) if timing_collector else None
+    timing_total_start = perf_counter()
+    step_idx = 1
     try:
-        # print(f"[extract_text_from_pdf] Processing {pdf_path} with coords_map keys: {list(coords_map.keys())}, apply_deskew={apply_deskew}")
-        doc = fitz.open(pdf_path)
-        if page_num >= len(doc):
-            print(f"[extract_text_from_pdf] Page {page_num} does not exist in {pdf_path}")
-            return {}
-        page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=300)
-        
-        img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        
-        if pix.n == 3:
-            img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        elif pix.n == 4:
-            img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+        os.makedirs(save_dir, exist_ok=True)
+
+        cached_pil = page_cache_image
+        if cached_pil is None and isinstance(page_cache_holder, dict):
+            cached_pil = page_cache_holder.get("image")
+        used_page_cache = cached_pil is not None
+        if used_page_cache:
+            t0 = perf_counter()
+            img_full = cached_pil.copy()
+            t1 = perf_counter()
+            if timing_collector and timing_block:
+                timing_collector.add_step(
+                    timing_block,
+                    step_idx,
+                    "страница из RAM-кэша (без диска)",
+                    t1 - t0,
+                )
+                step_idx += 1
         else:
-            img_cv = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+            # 1) PDF -> pixmap (самый дорогой кусок по времени/памяти)
+            t0 = perf_counter()
+            doc = fitz.open(pdf_path)
+            if page_num >= len(doc):
+                print(f"[extract_text_from_pdf] Page {page_num} does not exist in {pdf_path}")
+                doc.close()
+                doc = None
+                return {}
+            page = doc.load_page(page_num)
 
-        if apply_deskew:
-            img_cv = deskew_image(img_cv)
+            # Оптимизация рендера:
+            # - alpha=False: меньше каналов/памяти
+            # - colorspace=RGB: предсказуемый формат
+            try:
+                pix = page.get_pixmap(dpi=300, alpha=False, colorspace=fitz.csRGB)
+            except TypeError:
+                # Фоллбек для старых версий PyMuPDF
+                pix = page.get_pixmap(dpi=300)
+            t1 = perf_counter()
+            if timing_collector and timing_block:
+                timing_collector.add_step(
+                    timing_block,
+                    step_idx,
+                    "PDF → PNG (рендер растра dpi=300, alpha=False)",
+                    t1 - t0,
+                )
+                step_idx += 1
 
-        img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-        img_full = Image.fromarray(img_rgb)
+            # 2) pixmap -> OpenCV BGR
+            t0 = perf_counter()
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 3:
+                img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            elif pix.n == 4:
+                img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+            else:
+                img_cv = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+            t1 = perf_counter()
+            if timing_collector and timing_block:
+                timing_collector.add_step(
+                    timing_block,
+                    step_idx,
+                    "конвертация pixmap → OpenCV (BGR)",
+                    t1 - t0,
+                )
+                step_idx += 1
 
-        os.makedirs(save_dir, exist_ok=True)
+            # 3) deskew (дорого на больших листах; уже оптимизировали внутри deskew_image)
+            if apply_deskew:
+                t0 = perf_counter()
+                img_cv = deskew_image(img_cv)
+                t1 = perf_counter()
+                if timing_collector and timing_block:
+                    timing_collector.add_step(
+                        timing_block,
+                        step_idx,
+                        "deskew (поиск угла + поворот)",
+                        t1 - t0,
+                    )
+                    step_idx += 1
 
-        os.makedirs(save_dir, exist_ok=True)
+            # 4) OpenCV -> PIL
+            t0 = perf_counter()
+            img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            img_full = Image.fromarray(img_rgb)
+            t1 = perf_counter()
+            if timing_collector and timing_block:
+                timing_collector.add_step(
+                    timing_block,
+                    step_idx,
+                    "конвертация OpenCV → PIL (RGB)",
+                    t1 - t0,
+                )
+                step_idx += 1
+
+            if isinstance(page_cache_holder, dict):
+                page_cache_holder["image"] = img_full.copy()
 
         offset_x = 0
         offset_y = 0
@@ -538,94 +1188,118 @@ def extract_text_from_pdf(pdf_path, coords_map, save_dir, apply_deskew=False, pa
                 anchor_rect = v
                 anchor_key = k
                 break
-        
-        if anchor_rect:
+
+        anchor_t0 = perf_counter()
+        use_cached_anchor = anchor_offset_cached is not None
+        if use_cached_anchor:
+            try:
+                offset_x = int(anchor_offset_cached[0])
+                offset_y = int(anchor_offset_cached[1])
+            except (TypeError, IndexError, ValueError):
+                offset_x, offset_y = 0, 0
+        elif anchor_rect:
             # ONLY run anchor logic if the map has an anchor key
             ax, ay, aw, ah = anchor_rect
             # Safety checks
             ax = max(0, ax)
             ay = max(0, ay)
             anchor_crop = img_full.crop((ax, ay, ax + aw, ay + ah))
-            
-            # Save debug image
-            base_fname = os.path.basename(pdf_path)
-            anchor_img_name = f"debug_anchor_{base_fname}.png"
-            anchor_img_path = os.path.join(save_dir, anchor_img_name)
-            anchor_crop.save(anchor_img_path)
-            
+
             if reader is not None:
                 try:
                     print("=" * 35)
-                    print(f"данные читаетсья вот из этого фото: {anchor_img_path}")
+                    print(f"[ANCHOR] OCR области якоря «БИН» ({os.path.basename(pdf_path)})")
                     print("=" * 35)
 
+                    # Оптимизация Anchor OCR:
+                    # уменьшаем картинку (если она большая), чтобы EasyOCR тратил меньше времени.
+                    # Важно: bbox из EasyOCR будет в координатах уменьшенного изображения, поэтому пересчитываем обратно.
+                    anchor_for_ocr = anchor_crop
+                    max_dim = max(anchor_for_ocr.size[0], anchor_for_ocr.size[1])
+                    scale = 1.0
+                    if max_dim > 900:
+                        scale = 900.0 / float(max_dim)
+                        new_w = max(1, int(anchor_for_ocr.size[0] * scale))
+                        new_h = max(1, int(anchor_for_ocr.size[1] * scale))
+                        anchor_for_ocr = anchor_for_ocr.resize((new_w, new_h), Image.BILINEAR)
+
                     # Fix: Pass numpy array to EasyOCR to avoid OpenCV 'can't open/read file' error with Cyrillic paths
-                    # Convert PIL to BGR numpy array
-                    anchor_np = cv2.cvtColor(np.array(anchor_crop), cv2.COLOR_RGB2BGR)
+                    anchor_np = cv2.cvtColor(np.array(anchor_for_ocr), cv2.COLOR_RGB2BGR)
                     anchor_results = reader.readtext(anchor_np, detail=1)
-                    
+
                     print("сырые данные из этого фото которые были взяты")
                     print("=" * 35)
-                    
-                    # DEBUG: Print all raw findings in anchor zone
-                    # print(f"\n[ANCHOR DEBUG RAW] File: {base_fname}")
-                    # print("  RAW (Все найденное в зоне якоря):")
+
                     if not anchor_results:
                         print("    (Пусто, OCR ничего не увидел)")
                     else:
                         for (bbox, text, prob) in anchor_results:
-                             # bbox=[[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-                             h = int(bbox[2][1] - bbox[0][1]) 
-                             print(f"    - '{text}' (H: {h}, Prob: {prob:.2f})")
+                            h = int(bbox[2][1] - bbox[0][1])
+                            print(f"    - '{text}' (H: {h}, Prob: {prob:.2f})")
 
-                    target_anchor_text = "ИНН" # якорь  
-                    
+                    target_anchor_text = "БИН"  # якорь
+
                     found_anchor = False
                     for (bbox, text, prob) in anchor_results:
                         if target_anchor_text in text:
-                            # Found anchor. Offset is relative to the anchor box top-left
-                            # The bbox is local to the crop.
-                            local_x = int(bbox[0][0])
-                            local_y = int(bbox[0][1])
-                            
-                            # Global shift:
-                            # We expected '1' at (0,0) inside the crop (ideal case).
-                            # Found at (local_x, local_y).
-                            # Shift = local_x, local_y
-                            
+                            # bbox координаты относятся к anchor_for_ocr (возможно уменьшено)
+                            local_x = float(bbox[0][0])
+                            local_y = float(bbox[0][1])
+                            if scale != 1.0:
+                                local_x = local_x / scale
+                                local_y = local_y / scale
+
                             offset_x = local_x
                             offset_y = local_y
-                            
+
                             print(f"[ANCHOR DEBUG] Якорь мы искали '{target_anchor_text}' нашли: '{text}'")
                             print(f"[ANCHOR DEBUG] Координаты которые мы ожидаем: х=0, у=0")
                             print(f"[ANCHOR DEBUG] Координаты найденного якоря: x={offset_x}, y={offset_y}")
                             print(f"[ANCHOR DEBUG] Расчет смещения: сдвиг по х={offset_x}, сдвиг по у={offset_y}")
-                            
+
                             found_anchor = True
                             break
-                    
+
                     if not found_anchor:
-                         print(f"[ANCHOR DEBUG] Якорь '{target_anchor_text}' не найден в {anchor_rect}. Смещение (0,0).")
-                         print(f"[ANCHOR DEBUG] Сохранено фото области поиска для проверки: {anchor_img_path}")
+                        print(f"[ANCHOR DEBUG] Якорь '{target_anchor_text}' не найден в {anchor_rect}. Смещение (0,0).")
                 except Exception as e:
                     print(f"[ANCHOR] Error: {e}")
+        anchor_t1 = perf_counter()
+        if timing_collector and timing_block:
+            if use_cached_anchor:
+                anchor_desc = "якорь из кэша (offset_x/offset_y)"
+            elif anchor_rect:
+                anchor_desc = "найти якорь (OCR EasyOCR по области БИН)"
+            else:
+                anchor_desc = "найти якорь (карта без якоря)"
+            timing_collector.add_step(timing_block, step_idx, anchor_desc, anchor_t1 - anchor_t0)
+            step_idx += 1
+
+        extracted_data["_anchor_offset"] = (int(offset_x), int(offset_y))
+
+        quiet_anchor_apply = used_page_cache
 
         for field_name, (x0, y0, w, h) in coords_map.items():
-            # Skip the anchor field itself if it shouldn't be extracted as data
             if field_name == anchor_key:
                 continue
+
+            field_t0 = perf_counter()
+            field_img_filename = None
                 
-            # Apply anchor offset
             if offset_x != 0 or offset_y != 0:
                  x0 = max(0, x0 + offset_x)
                  y0 = max(0, y0 + offset_y)
-                 if anchor_key: # Only log if we actually used an anchor
+                 if anchor_key and not quiet_anchor_apply:
                      print(f"[ANCHOR DEBUG] Применяем к полю '{field_name}'... New coords: ({x0}, {y0})")
 
             x1 = min(x0 + w, img_full.width)
             y1 = min(y0 + h, img_full.height)
             
             crop_img = img_full.crop((x0, y0, x1, y1))
+            plate_ocr_precomputed = False
+            selected_threshold = None
+            selected_plate_pipeline = None
+            allowlist_plate = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/"
             
             if any(x in field_name for x in ["ФИО Водит.", "Марка", "Гос_номер"]):
                 r, g, b = crop_img.split()
@@ -635,35 +1309,237 @@ def extract_text_from_pdf(pdf_path, coords_map, save_dir, apply_deskew=False, pa
                     threshold = fio_threshold
                     crop_img = crop_img.point(lambda p: 255 if p > threshold else 0)
                 elif "Гос_номер" in field_name:
-                    threshold = 165
-                    crop_img = crop_img.point(lambda p: 255 if p > threshold else 0)
+                    threshold_options = [165, 162, 160, 157, 155, 167, 170, 172, 174]
+                    best_results = []
+                    successful_results = []
+                    selected_threshold = threshold_options[0]
+                    min_height_plate = CURRENT_MIN_HEIGHT_CONFIG.get(field_name, 0)
+
+                    def _ocr_read_plate(img_np):
+                        active = plate_reader or reader
+                        if active is None:
+                            return []
+                        try:
+                            return active.readtext(img_np, detail=1, allowlist=allowlist_plate)
+                        except TypeError:
+                            return active.readtext(img_np, detail=1)
+
+                    def _score_plate_results(candidate_results):
+                        if not candidate_results:
+                            return 0.0, 0
+                        filtered = []
+                        probs = []
+                        for (bbox, text, prob) in candidate_results:
+                            height = int(((bbox[3][1] - bbox[0][1]) + (bbox[2][1] - bbox[1][1])) / 2)
+                            if height >= min_height_plate:
+                                filtered.append(str(text))
+                                try:
+                                    probs.append(float(prob))
+                                except Exception:
+                                    pass
+
+                        matches = 0
+                        for t in filtered:
+                            cleaned = DataCleaner.clean_plate_text(t)
+                            parts = [p for p in cleaned.split("/") if p]
+                            if parts:
+                                for p in parts:
+                                    if DataCleaner.is_plate_token_like(p):
+                                        matches += 1
+                            else:
+                                if DataCleaner.is_plate_token_like(cleaned):
+                                    matches += 1
+
+                        avg_prob = (sum(probs) / len(probs)) if probs else 0.0
+                        bonus_two = 5.0 if matches >= 2 else 0.0
+                        return matches * 10.0 + bonus_two + avg_prob, matches
+
+                    def _plate_preprocess_variants(gray_np):
+                        variants = []
+                        g = gray_np.astype(np.uint8)
+                        variants.append(("raw", None, g))
+
+                        try:
+                            g2 = cv2.resize(g, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                            variants.append(("raw_x2", None, g2))
+                        except Exception:
+                            pass
+
+                        try:
+                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                            g_clahe = clahe.apply(g)
+                            variants.append(("clahe", None, g_clahe))
+                            g_clahe2 = cv2.resize(g_clahe, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                            variants.append(("clahe_x2", None, g_clahe2))
+                        except Exception:
+                            pass
+
+                        try:
+                            adapt = cv2.adaptiveThreshold(
+                                g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+                            )
+                            variants.append(("adaptive_gauss_31_7", None, adapt))
+                        except Exception:
+                            pass
+
+                        try:
+                            _t, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                            variants.append(("otsu", None, otsu))
+                        except Exception:
+                            pass
+
+                        for thr in threshold_options:
+                            try:
+                                _t, bin1 = cv2.threshold(g, int(thr), 255, cv2.THRESH_BINARY)
+                                variants.append((f"thr_{thr}", thr, bin1))
+                            except Exception:
+                                pass
+                            try:
+                                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                                g_clahe = clahe.apply(g)
+                                _t, bin2 = cv2.threshold(g_clahe, int(thr), 255, cv2.THRESH_BINARY)
+                                variants.append((f"clahe_thr_{thr}", thr, bin2))
+                            except Exception:
+                                pass
+
+                        return variants
+
+                    gray_np = np.array(crop_img)
+                    variants = _plate_preprocess_variants(gray_np)
+                    plate_pipeline_attempts = []
+
+                    best_score = -1.0
+                    best_meta = None
+                    best_candidate_results = []
+                    chosen_plate_attempt_num = None
+
+                    for idx, (pname, pthr, img_np) in enumerate(variants):
+                        try:
+                            candidate_results = _ocr_read_plate(img_np)
+                            score, matches = _score_plate_results(candidate_results)
+                            plate_raw_groups = []
+                            for (bbox, text, prob) in candidate_results:
+                                height = int(
+                                    ((bbox[3][1] - bbox[0][1]) + (bbox[2][1] - bbox[1][1])) / 2
+                                )
+                                try:
+                                    pval = float(prob)
+                                except Exception:
+                                    pval = 0.0
+                                plate_raw_groups.append((str(text), height, pval))
+                            plate_pipeline_attempts.append(
+                                {
+                                    "attempt": idx + 1,
+                                    "pipeline": pname,
+                                    "threshold": pthr,
+                                    "score": round(score, 2),
+                                    "matches": matches,
+                                    "raw_groups": plate_raw_groups,
+                                    "selected": False,
+                                }
+                            )
+
+                            if idx == 0:
+                                best_results = candidate_results
+                                selected_threshold = pthr if pthr is not None else selected_threshold
+                                selected_plate_pipeline = pname
+
+                            if score > best_score:
+                                best_score = score
+                                best_meta = (pname, pthr, img_np)
+                                best_candidate_results = candidate_results
+
+                            if matches >= 2:
+                                successful_results = candidate_results
+                                selected_plate_pipeline = pname
+                                selected_threshold = pthr if pthr is not None else selected_threshold
+                                chosen_plate_attempt_num = idx + 1
+                                break
+                        except Exception as retry_err:
+                            print(f"[extract_text_from_pdf] Plate pipeline OCR error pipeline={pname} thr={pthr}: {retry_err}")
+
+                    if successful_results:
+                        results = successful_results
+                    else:
+                        results = best_candidate_results or best_results
+                        extracted_data["_plate_retry_failed"] = True
+                        if best_meta is not None and plate_pipeline_attempts:
+                            try:
+                                chosen_plate_attempt_num = (
+                                    plate_pipeline_attempts.index(
+                                        next(
+                                            a
+                                            for a in plate_pipeline_attempts
+                                            if a["pipeline"] == best_meta[0]
+                                            and a.get("threshold") == best_meta[1]
+                                        )
+                                    )
+                                    + 1
+                                )
+                            except (StopIteration, ValueError):
+                                chosen_plate_attempt_num = None
+                        print(
+                            f"[extract_text_from_pdf] Plate: ни одна попытка не дала 2 валидных части "
+                            f"({len(plate_pipeline_attempts)} пайплайнов). "
+                            f"Взят лучший по score, pipeline={selected_plate_pipeline}, thr={selected_threshold}."
+                        )
+
+                    if chosen_plate_attempt_num is None and plate_pipeline_attempts:
+                        chosen_plate_attempt_num = len(plate_pipeline_attempts)
+                    for att in plate_pipeline_attempts:
+                        att["selected"] = att.get("attempt") == chosen_plate_attempt_num
+
+                    try:
+                        if best_meta is not None:
+                            pname, pthr, best_np = best_meta
+                            selected_plate_pipeline = selected_plate_pipeline or pname
+                            crop_img = Image.fromarray(best_np)
+                    except Exception:
+                        crop_img = crop_img.point(lambda p: 255 if p > selected_threshold else 0)
+
+                    extracted_data["_plate_pipeline"] = selected_plate_pipeline
+                    extracted_data["_plate_threshold"] = selected_threshold
+                    extracted_data["_field_logs"]["Гос_номер ()"] = {
+                        "attempts": plate_pipeline_attempts,
+                        "cleaning_header": _plate_cleaning_header(threshold_options, min_height_plate),
+                        "winning_pipeline": selected_plate_pipeline,
+                        "winning_threshold": selected_threshold,
+                        "chosen_attempt": chosen_plate_attempt_num,
+                        "retry_failed": bool(extracted_data.get("_plate_retry_failed")),
+                    }
+                    plate_ocr_precomputed = True
             
-            img_filename = get_safe_filename(pdf_path, field_name)
-            img_path = os.path.join(save_dir, img_filename)
-            crop_img.save(img_path)
-            # print(f"[extract_text_from_pdf] Saved image: {img_filename} (original: {os.path.basename(pdf_path)}_{field_name})")
+            write_preview = save_preview_files and _is_preview_photo_field(field_name)
+            img_filename = get_safe_filename(pdf_path, field_name) if write_preview else None
+            field_img_filename = img_filename
+            img_path = os.path.join(save_dir, img_filename) if img_filename else None
 
             if reader is None:
-                print(f"[extract_text_from_pdf] OCR reader is not initialized. Skipping OCR for {img_path}")
+                if img_path:
+                    print(f"[extract_text_from_pdf] OCR reader is not initialized. Skipping OCR for {img_path}")
                 results = []
             else:
                 try:
-                    if not os.path.exists(img_path):
-                        print(f"[extract_text_from_pdf] ERROR: Image file does not exist: {img_path}")
-                        results = []
-                    else:
-                        test_img = cv2.imread(img_path)
-                        if test_img is None:
-                            print(f"[extract_text_from_pdf] ERROR: cv2.imread returned None for {img_path}. File may have encoding issues.")
-                            results = []
-                        else:
-                            results = reader.readtext(img_path, detail=1)
-                            # print(f"[extract_text_from_pdf] OCR successful for {img_filename}, found {len(results)} text regions")
+                    if not plate_ocr_precomputed:
+                        results = _easyocr_read_pil(crop_img)
                 except Exception as e:
-                    print(f"[extract_text_from_pdf] OCR error for {img_path}: {e}")
+                    print(f"[extract_text_from_pdf] OCR error for field '{field_name}': {e}")
                     import traceback
                     traceback.print_exc()
                     results = []
+
+            if write_preview and img_path:
+                try:
+                    _save_preview_jpeg(crop_img, img_path)
+                    if preview_workspace_root:
+                        fk = _preview_field_key(field_name)
+                        if fk is not None:
+                            rel = _preview_relpath(img_path, preview_workspace_root)
+                            extracted_data.setdefault("_preview_by_field", {}).setdefault(
+                                str(fk), []
+                            ).append(rel)
+                except Exception as e:
+                    print(f"[extract_text_from_pdf] Не удалось сохранить JPEG предпросмотра {img_path}: {e}")
             text_parts = []
             raw_items = []
             
@@ -673,6 +1549,14 @@ def extract_text_from_pdf(pdf_path, coords_map, save_dir, apply_deskew=False, pa
                 height = int(((bbox[3][1] - bbox[0][1]) + (bbox[2][1] - bbox[1][1])) / 2)
                 
                 raw_items.append((text, height))
+                extracted_data["ocr_debug"].setdefault(field_name, []).append(
+                    {
+                        "text": str(text),
+                        "height": height,
+                        "min_height": int(min_height),
+                        "passed": bool(height >= min_height),
+                    }
+                )
 
                 if height >= min_height:
                     text_parts.append(text)
@@ -685,11 +1569,54 @@ def extract_text_from_pdf(pdf_path, coords_map, save_dir, apply_deskew=False, pa
             else:
                 extracted_data[field_name] = " ".join(text_parts)
                 extracted_data[field_name] = " ".join(text_parts).strip()
-        
-        doc.close()
+
+            mode_lbl = extract_mode_label or ("кэш страницы" if used_page_cache else "полный OCR")
+            if "Марка" in field_name:
+                filtered_brand = DataCleaner.get_cleaned_big_3_list(raw_items)
+                _record_field_attempt(
+                    extracted_data,
+                    field_name,
+                    {
+                        "ocr_mode": mode_lbl,
+                        "cleaning": _brand_cleaning_desc(),
+                        "raw_groups": list(raw_items),
+                        "filtered_groups": filtered_brand,
+                        "result": " / ".join(filtered_brand) if filtered_brand else "",
+                    },
+                )
+            if "ФИО Водит." in field_name:
+                fio_fmt_log, fio_cl_log = DataCleaner.clean_fio_raw(raw_items, {})
+                _record_field_attempt(
+                    extracted_data,
+                    field_name,
+                    {
+                        "ocr_mode": mode_lbl,
+                        "threshold": fio_threshold,
+                        "cleaning": _fio_cleaning_desc(fio_threshold),
+                        "raw_groups": list(raw_items),
+                        "result": fio_cl_log,
+                        "formatted": fio_fmt_log,
+                    },
+                )
+
+            if timing_collector and timing_block and field_img_filename:
+                field_t1 = perf_counter()
+                timing_collector.add_step(
+                    timing_block,
+                    step_idx,
+                    f"OCR поля «{field_name}»"
+                    + (f" + JPEG ({field_img_filename})" if field_img_filename else " (RAM)"),
+                    field_t1 - field_t0,
+                )
+                step_idx += 1
     except Exception as e:
         print(f"Error processing {pdf_path}: {e}")
-    
+    finally:
+        if doc is not None:
+            doc.close()
+        if timing_collector and timing_block:
+            timing_collector.set_block_total(timing_block, perf_counter() - timing_total_start)
+
     return extracted_data
 def extract_data_from_xlsx(xlsx_path):
     extracted_data = {}
@@ -734,26 +1661,57 @@ def extract_data_from_xlsx(xlsx_path):
     return extracted_data, source_map
 
 def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code, nds_percent, save_photos=False):
+    """
+    Обрабатывает ZIP. Возвращает (results, preview_workspace).
+
+    preview_workspace — временная папка в системном temp (не media/temp_ocr):
+    только кропы для страницы предпросмотра; удаляется после скачивания Excel.
+    """
     global CURRENT_MIN_HEIGHT_CONFIG
-    base_temp_dir = os.path.join(settings.MEDIA_ROOT, "temp_ocr")
+
+    legacy_media_temp = os.path.join(settings.MEDIA_ROOT, "temp_ocr")
+    if os.path.isdir(legacy_media_temp):
+        shutil.rmtree(legacy_media_temp, ignore_errors=True)
+        print(f"[process_zip_file] Удалена устаревшая папка: {legacy_media_temp}")
+
+    with _ocr_temp_workspace() as base_temp_dir:
+        return _process_zip_file_in_workspace(
+            base_temp_dir,
+            zip_file,
+            dollar_rate,
+            selected_date,
+            tn_ved_code,
+            bnd_code,
+            nds_percent,
+            save_photos,
+        )
+
+
+def _process_zip_file_in_workspace(
+    base_temp_dir,
+    zip_file,
+    dollar_rate,
+    selected_date,
+    tn_ved_code,
+    bnd_code,
+    nds_percent,
+    save_photos,
+):
     upload_dir = os.path.join(base_temp_dir, "upload")
     extract_dir = os.path.join(base_temp_dir, "extracted")
     imgs_root_dir = os.path.join(settings.MEDIA_ROOT, "imgs")
     preview_imgs_dir = os.path.join(base_temp_dir, "preview_imgs")
     selected_maps = get_maps_by_zip_name(getattr(zip_file, "name", ""))
     CURRENT_MIN_HEIGHT_CONFIG = selected_maps["min_height"]
+    timing_collector = _TimingCollector(enabled=True)
+    process_total_start = perf_counter()
     type_1_map = selected_maps["type_1"]
     type_2_map = selected_maps["type_2"]
     type_3_map = selected_maps["type_3"]
     type_2_page_2_map = selected_maps["type_2_page_2"]
 
-    if os.path.exists(base_temp_dir):
-        print(f"[process_zip_file] Cleaning up old temp dir: {base_temp_dir}")
-        shutil.rmtree(base_temp_dir)
-    else:
-        print(f"[process_zip_file] No old temp dir tokens to clean: {base_temp_dir}")
-    
-    os.makedirs(imgs_root_dir, exist_ok=True)
+    if save_photos:
+        os.makedirs(imgs_root_dir, exist_ok=True)
     os.makedirs(upload_dir, exist_ok=True)
     os.makedirs(extract_dir, exist_ok=True)
     os.makedirs(preview_imgs_dir, exist_ok=True)
@@ -816,10 +1774,12 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
     for obj_idx, t1_path in enumerate(type_1_files):
         print(f"Processing Type 1 file: {t1_path} (Basename: {os.path.basename(t1_path)})")
         
-        temp_img_path = os.path.join(base_temp_dir, f"temp_imgs_processing_obj_{obj_idx}")
-        if os.path.exists(temp_img_path):
-            shutil.rmtree(temp_img_path)
-        os.makedirs(temp_img_path, exist_ok=True)
+        preview_obj_dir = os.path.join(preview_imgs_dir, f"obj_{obj_idx}")
+        os.makedirs(preview_obj_dir, exist_ok=True)
+        t1_preview_dir = os.path.join(preview_obj_dir, "type1")
+        if os.path.exists(t1_preview_dir):
+            shutil.rmtree(t1_preview_dir)
+        os.makedirs(t1_preview_dir, exist_ok=True)
         
         is_xlsx = t1_path.lower().endswith('.xlsx')
         t1_data = {}
@@ -839,7 +1799,9 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                 surname_clean = "Unknown"
         else:
             source_map = {}
-            fio_thresholds = [170, 150, 130, 200]
+            # Сначала пробуем более "жёсткую" очистку (выше порог), чтобы убрать влияние штампа/печати.
+            fio_thresholds = [170, 173, 175, 178, 180, 185, 190, 168, 165, 162, 160, 155, 150, 130]
+            page_cache_holder = {}
             
             best_fio_formatted = ""
             best_fio_clean = ""
@@ -848,64 +1810,149 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
             
             t2_match = False
             t3_match = False
+            all_field_logs = {}
+            fio_meta_attempts = []
+            chosen_fio_attempt = None
             
             for attempt, thresh in enumerate(fio_thresholds):
-                print(f"[PROCESS] Попытка {attempt+1} для {os.path.basename(t1_path)}, порог {thresh}")
                 if attempt == 0:
-                    t1_data = extract_text_from_pdf(t1_path, type_1_map, temp_img_path, apply_deskew=True, fio_threshold=thresh)
+                    print(f"[PROCESS] Попытка {attempt+1} для {os.path.basename(t1_path)}, порог {thresh} (полный OCR)")
+                    t1_data = extract_text_from_pdf(
+                        t1_path,
+                        type_1_map,
+                        t1_preview_dir,
+                        apply_deskew=True,
+                        fio_threshold=thresh,
+                        page_cache_holder=page_cache_holder,
+                        timing_collector=timing_collector,
+                        extract_mode_label="полный OCR (все поля: марка, номер, ФИО, …)",
+                        preview_workspace_root=base_temp_dir,
+                    )
+                    _merge_field_logs(all_field_logs, t1_data.get("_field_logs"))
                 else:
-                    anchor_key = next((k for k in type_1_map if "Якорь" in k or "Anchor" in k), None)
+                    print(f"[PROCESS] Попытка {attempt+1} для {os.path.basename(t1_path)}, порог {thresh} (только ФИО, RAM-кэш страницы)")
                     partial_map = {"ФИО Водит. (4)": type_1_map["ФИО Водит. (4)"]}
-                    if anchor_key: partial_map[anchor_key] = type_1_map[anchor_key]
-                    partial_data = extract_text_from_pdf(t1_path, partial_map, temp_img_path, apply_deskew=True, fio_threshold=thresh)
+                    anchor_off = t1_data.get("_anchor_offset")
+                    if not isinstance(anchor_off, (list, tuple)) or len(anchor_off) != 2:
+                        anchor_off = (0, 0)
+                    anchor_off = (int(anchor_off[0]), int(anchor_off[1]))
+                    partial_data = extract_text_from_pdf(
+                        t1_path,
+                        partial_map,
+                        t1_preview_dir,
+                        apply_deskew=True,
+                        fio_threshold=thresh,
+                        page_cache_image=page_cache_holder.get("image"),
+                        anchor_offset_cached=anchor_off,
+                        timing_collector=timing_collector,
+                        extract_mode_label="только ФИО (RAM-кэш, марка/номер не перечитываются)",
+                        preview_workspace_root=base_temp_dir,
+                    )
+                    _merge_field_logs(all_field_logs, partial_data.get("_field_logs"))
                     if "ФИО Водит. (4)" in partial_data:
                         t1_data["ФИО Водит. (4)"] = partial_data["ФИО Водит. (4)"]
+                    od = partial_data.get("ocr_debug")
+                    if isinstance(od, dict) and od.get("ФИО Водит. (4)"):
+                        t1_data.setdefault("ocr_debug", {})["ФИО Водит. (4)"] = od["ФИО Водит. (4)"]
                 
                 fio_raw_data = t1_data.get("ФИО Водит. (4)", [])
                 fio_formatted, fio_clean = DataCleaner.clean_fio_raw(fio_raw_data, {})
+
+                fio_rules_passed = DataCleaner.fio_rules_ok(fio_clean)
+                fio_meta_attempts.append(
+                    {
+                        "attempt": attempt + 1,
+                        "threshold": thresh,
+                        "mode": "полный OCR" if attempt == 0 else "только ФИО",
+                        "raw_groups": list(fio_raw_data) if isinstance(fio_raw_data, list) else [],
+                        "fio_clean": fio_clean,
+                        "rules_passed": fio_rules_passed,
+                        "t2_match": False,
+                        "t3_match": False,
+                    }
+                )
                 surname_full = fio_clean
                 surname_clean = sanitize_surname(surname_full.split()[0].strip()) if surname_full else "Unknown"
                 if not surname_clean:
                     surname_clean = "Unknown"
                 
-                if attempt == 0:
-                     best_fio_formatted = fio_formatted
-                     best_fio_clean = fio_clean
-                     best_surname_clean = surname_clean
-                     best_surname_full = surname_full
+                # Если ФИО "похоже на мусор" (штамп/лишние знаки/точки) — не принимаем и пробуем следующую попытку.
+                if not fio_rules_passed:
+                    bad_chars = "".join(sorted({ch for ch in DataCleaner.FIO_DISALLOWED_CHARS if ch in str(fio_clean)}))
+                    print(f"[PROCESS] ФИО правила не прошли (attempt={attempt+1}, порог={thresh}, dots={str(fio_clean).count('.')}, bad_chars='{bad_chars}'). Повтор OCR.")
+                    fio_meta_attempts[-1]["rules_fail_reason"] = f"точек={str(fio_clean).count('.')}, bad_chars={bad_chars!r}"
+                    continue
+
+                # Зафиксируем best только после того, как ФИО прошло правила.
+                if attempt == 0 or not best_fio_clean:
+                    best_fio_formatted = fio_formatted
+                    best_fio_clean = fio_clean
+                    best_surname_clean = surname_clean
+                    best_surname_full = surname_full
+                
+                # Если первая попытка была "плохая", но текущая проходит правила — обновим best на будущее fallback.
+                if attempt != 0 and best_fio_clean and not DataCleaner.fio_rules_ok(best_fio_clean):
+                    best_fio_formatted = fio_formatted
+                    best_fio_clean = fio_clean
+                    best_surname_clean = surname_clean
+                    best_surname_full = surname_full
                 
                 t2_match = False
                 t3_match = False
+                matched_filename_surname = None
+                
                 if surname_clean and surname_clean != "Unknown":
                     svariants = normalize_surname(surname_clean)
                     for t2p in type_2_files:
                         if t2p in used_type_2: continue
-                        name = os.path.basename(t2p).lower()
-                        if any(v.lower() in name for v in svariants): t2_match = True; break
-                        words = re.findall(r'\w+', name)
-                        for v in svariants:
-                            if any(difflib.SequenceMatcher(None, v.lower(), w).ratio() > 0.80 for w in words): t2_match = True; break
+                        fname_surname = extract_surname_from_filename(t2p)
+                        if fname_surname:
+                            for v in svariants:
+                                ratio = difflib.SequenceMatcher(None, v.lower(), fname_surname.lower()).ratio()
+                                if ratio >= 0.60:
+                                    t2_match = True
+                                    matched_filename_surname = fname_surname
+                                    break
                             if t2_match: break
-                        if t2_match: break
                         
                     for t3p in type_3_files:
                         if t3p in used_type_3: continue
-                        name = os.path.basename(t3p).lower()
-                        if any(v.lower() in name for v in svariants): t3_match = True; break
-                        words = re.findall(r'\w+', name)
-                        for v in svariants:
-                            if any(difflib.SequenceMatcher(None, v.lower(), w).ratio() > 0.80 for w in words): t3_match = True; break
+                        fname_surname = extract_surname_from_filename(t3p)
+                        if fname_surname:
+                            for v in svariants:
+                                ratio = difflib.SequenceMatcher(None, v.lower(), fname_surname.lower()).ratio()
+                                if ratio >= 0.60:
+                                    t3_match = True
+                                    if not matched_filename_surname:
+                                        matched_filename_surname = fname_surname
+                                    break
                             if t3_match: break
-                        if t3_match: break
                 
+                fio_meta_attempts[-1]["t2_match"] = t2_match
+                fio_meta_attempts[-1]["t3_match"] = t3_match
+
                 if t2_match or t3_match:
+                     if matched_filename_surname:
+                         fio_formatted = matched_filename_surname
+                         fio_clean = matched_filename_surname
+                         surname_clean = matched_filename_surname
+                         surname_full = matched_filename_surname
                      best_fio_formatted = fio_formatted
                      best_fio_clean = fio_clean
                      best_surname_clean = surname_clean
                      best_surname_full = surname_full
-                     print(f" [MATCH FOUND] на попытке {attempt+1}")
+                     chosen_fio_attempt = attempt + 1
+                     print(f" [MATCH FOUND] на попытке {attempt+1} с фамилией из файла: {matched_filename_surname}")
                      break
             
+            if chosen_fio_attempt is None and fio_meta_attempts:
+                for meta in reversed(fio_meta_attempts):
+                    if meta.get("rules_passed"):
+                        chosen_fio_attempt = meta.get("attempt")
+                        break
+                if chosen_fio_attempt is None:
+                    chosen_fio_attempt = fio_meta_attempts[-1].get("attempt")
+
             fio_formatted = best_fio_formatted
             fio_clean = best_fio_clean
             surname_clean = best_surname_clean
@@ -928,11 +1975,14 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                                  if not w1 or not w2: return 0
                                  return len(w1.intersection(w2)) / max(len(w1), len(w2))
                              
-                             r2 = difflib.SequenceMatcher(None, best_surname_full.lower(), n2.lower()).ratio()
-                             r3 = difflib.SequenceMatcher(None, best_surname_full.lower(), n3.lower()).ratio()
+                             # Для fallback лучше сравнивать уже "очищенную" фамилию (без мусорных символов).
+                             base_for_fallback = best_surname_clean if best_surname_clean else best_surname_full
+                             r2 = difflib.SequenceMatcher(None, str(base_for_fallback).lower(), n2.lower()).ratio()
+                             r3 = difflib.SequenceMatcher(None, str(base_for_fallback).lower(), n3.lower()).ratio()
                              
-                             if r2 > 0.6 or r3 > 0.6 or get_overlap(best_surname_full, n2) >= 0.5:
-                                 fio_formatted = n2.title()
+                             if r2 > 0.6 or r3 > 0.6 or get_overlap(base_for_fallback, n2) >= 0.5:
+                                 matched_surname = extract_surname_from_filename(f_t2) or extract_surname_from_filename(f_t3)
+                                 fio_formatted = matched_surname if matched_surname else n2.title()
                                  fio_clean = fio_formatted
                                  surname_full = fio_formatted
                                  surname_clean = sanitize_surname(surname_full.split()[0].strip()) if surname_full else "Unknown"
@@ -942,6 +1992,7 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                                  t2_match = True
                                  break
                          if t2_match: break
+
         context = {
             'surname': surname_clean,
             'zip_filename': zip_file.name,
@@ -949,10 +2000,6 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
             'type_3_files': type_3_files,
             'filename': os.path.basename(t1_path)
         }
-
-        # print(f"[MATCH DEBUG] File: {os.path.basename(t1_path)}")
-        # print(f" [MATCH DEBUG] Extracted Raw FIO: {fio_raw_data}")
-        # print(f" [MATCH DEBUG] Cleaned Surname: '{surname_clean}'")
 
         found_t2 = False
         found_t3 = False
@@ -969,109 +2016,117 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
         preview_obj_dir = os.path.join(preview_imgs_dir, f"obj_{len(final_results)}")
         os.makedirs(preview_obj_dir, exist_ok=True)
         preview_image_paths = []
-        
-        if os.path.exists(temp_img_path):
-            for img_file in os.listdir(temp_img_path):
-                src_path = os.path.join(temp_img_path, img_file)
-                dst_path = os.path.join(preview_obj_dir, img_file)
-                shutil.copy2(src_path, dst_path)
-                rel_path = os.path.relpath(dst_path, settings.MEDIA_ROOT)
-                preview_image_paths.append(rel_path.replace("\\", "/"))
-        
+        field_images = {}
+        if not is_xlsx:
+            _merge_preview_paths_from_extract(field_images, t1_data)
+        _scan_dir_field_images(
+            t1_preview_dir, base_temp_dir, field_images, preview_image_paths
+        )
+
         if save_photos:
             os.makedirs(person_img_dir, exist_ok=True)
-            if os.path.exists(temp_img_path):
-                for img_file in os.listdir(temp_img_path):
-                    shutil.move(os.path.join(temp_img_path, img_file), os.path.join(person_img_dir, img_file))
+            if os.path.exists(t1_preview_dir):
+                for img_file in os.listdir(t1_preview_dir):
+                    shutil.copy2(os.path.join(t1_preview_dir, img_file), os.path.join(person_img_dir, img_file))
         
         plate_val = ""
         car_val = ""
         big_3_cleaned_list = []
+        plate_groups = []
+        plate_format_warning = False
+        plate_retry_failed = bool(t1_data.get("_plate_retry_failed"))
+        raw_groups = {}
+        ocr_debug_merged = {}
 
         if is_xlsx:
             plate_val = t1_data.get("Гос.номер_XLSX", "")
             car_val = t1_data.get("Марка_XLSX", "")
             big_3_cleaned_list = [car_val, plate_val]
+            if plate_val:
+                parts = [p.strip() for p in str(plate_val).split("/") if p.strip()]
+                plate_groups = parts
+                # Требуем 2 части (до/после "/") и соответствие шаблону для каждой части
+                if len(parts) != 2 or not all(DataCleaner.is_plate_token_like(p) for p in parts):
+                    plate_format_warning = True
         else:
             # --- Process BRAND ---
             brand_raw = t1_data.get("Марка", [])
             # For brand, we just take all text found in the box
-            car_val = " ".join([t.strip() for t, h in brand_raw if t.strip()])
+            raw_brand_str = " ".join([t.strip() for t, h in brand_raw if t.strip()])
+            car_val = clean_brand_name(raw_brand_str)
             
             # --- Process PLATE ---
             plate_raw = t1_data.get("Гос_номер ()", [])
             plate_cleaned_list = DataCleaner.get_cleaned_big_3_list(plate_raw)
+            plate_groups = list(plate_cleaned_list)
             
             # Debug: Capture filtered items with heights for Plate
             filtered_debug = []
             for text, h in plate_raw:
-                if 35 < h < 46:
+                if 35 < h < 55:
                      filtered_debug.append(f"{text} (H: {h})")
             filtered_debug_str = " | ".join(filtered_debug)
             
             if plate_cleaned_list:
-                if len(plate_cleaned_list) >= 2:
-                    # Assume first is number, last is region, or vice versa. 
-                    # Usually: [Number, Region]
-                    p1 = DataCleaner.clean_plate_text(plate_cleaned_list[0])
-                    p2 = DataCleaner.clean_plate_text(plate_cleaned_list[-1])
+                valid_plates = [t for t in plate_cleaned_list if DataCleaner.is_plate_token_like(t)]
+                if len(valid_plates) >= 2:
+                    p1 = DataCleaner.clean_plate_text(valid_plates[0])
+                    p2 = DataCleaner.clean_plate_text(valid_plates[-1])
                     plate_val = f"{p1} / {p2}"
+                elif len(valid_plates) == 1:
+                    plate_val = DataCleaner.clean_plate_text(valid_plates[0])
                 else:
-                    plate_val = DataCleaner.clean_plate_text(plate_cleaned_list[0])
+                    if len(plate_cleaned_list) >= 2:
+                        p1 = DataCleaner.clean_plate_text(plate_cleaned_list[0])
+                        p2 = DataCleaner.clean_plate_text(plate_cleaned_list[-1])
+                        plate_val = f"{p1} / {p2}"
+                    else:
+                        plate_val = DataCleaner.clean_plate_text(plate_cleaned_list[0])
+
+            # Validate extracted plate against expected pattern (each side)
+            parts = [p.strip() for p in str(plate_val).split("/") if p.strip()]
+            if len(parts) != 2 or not all(DataCleaner.is_plate_token_like(p) for p in parts):
+                plate_format_warning = True
+            if plate_retry_failed:
+                plate_format_warning = True
+
+            # Raw groups from OCR before filtering (для предпросмотра)
+            try:
+                ocr_debug_merged.update(t1_data.get("ocr_debug", {}) if isinstance(t1_data.get("ocr_debug"), dict) else {})
+            except Exception:
+                pass
+
+            def _texts_for_field(fname: str):
+                items = ocr_debug_merged.get(fname) or []
+                return [str(i.get("text", "")).strip() for i in items if str(i.get("text", "")).strip()]
+
+            raw_groups[2] = _texts_for_field("Марка")
+            raw_groups[3] = _texts_for_field("Гос_номер ()")
+            raw_groups[4] = _texts_for_field("ФИО Водит. (4)")
+            raw_groups[7] = _texts_for_field("Кол.тон (7)")
+
+            ocr_details_text = format_driver_ocr_details(
+                os.path.basename(t1_path),
+                all_field_logs,
+                fio_meta_attempts=fio_meta_attempts,
+                final_brand=car_val,
+                final_plate=plate_val,
+                final_fio=fio_formatted,
+                chosen_fio_attempt=chosen_fio_attempt,
+            )
+            print(ocr_details_text)
+            driver_debug_info.append(ocr_details_text)
         
         if selected_date:
             user_date_str = selected_date.strftime('%d.%m.%Y') if hasattr(selected_date, 'strftime') else str(selected_date)
         else:
             user_date_str = ""
         
-        field_images = {}
-        
-        if os.path.exists(preview_obj_dir):
-            print(f"[process_zip_file] Scanning preview_obj_dir: {preview_obj_dir}")
-            for img_file in os.listdir(preview_obj_dir):
-                img_path = os.path.join(preview_obj_dir, img_file)
-                if os.path.isfile(img_path):
-                    rel_path = os.path.relpath(img_path, settings.MEDIA_ROOT)
-                    rel_path = rel_path.replace("\\", "/")
-                    
-                    img_file_lower = img_file.lower()
-                    print(f"[process_zip_file] Checking file: {img_file}")
-                    
-                    if (("date" in img_file_lower or "дата" in img_file_lower) and 
-                        ("_1" in img_file_lower or "(1)" in img_file or img_file_lower.endswith("_1.png"))):
-                        if 1 not in field_images:
-                            field_images[1] = []
-                        field_images[1].append(rel_path)
-                        print(f"[process_zip_file] Added to field_images[1]: {img_file}")
-                    elif (("fio" in img_file_lower or "фио" in img_file_lower or "vodit" in img_file_lower or "водит" in img_file_lower) and 
-                          ("_4" in img_file_lower or "(4)" in img_file or "4" in img_file_lower)):
-                        if 4 not in field_images:
-                            field_images[4] = []
-                        field_images[4].append(rel_path)
-                        print(f"[process_zip_file] Added to field_images[4]: {img_file}")
-                    elif (("kol" in img_file_lower or "кол" in img_file_lower) and 
-                          ("ton" in img_file_lower or "тон" in img_file_lower or "_7" in img_file_lower or "(7)" in img_file)):
-                        if 7 not in field_images:
-                            field_images[7] = []
-                        field_images[7].append(rel_path)
-                        print(f"[process_zip_file] Added to field_images[7]: {img_file}")
-                    elif (("marka" in img_file_lower or "марка" in img_file_lower) and 
-                          not ("gos" in img_file_lower or "гос" in img_file_lower or 
-                               "nomer" in img_file_lower or "номер" in img_file_lower)):
-                        if 2 not in field_images:
-                            field_images[2] = []
-                        field_images[2].append(rel_path)
-                        print(f"[process_zip_file] Added to field_images[2]: {img_file}")
-                    elif (("gos" in img_file_lower or "гос" in img_file_lower or 
-                           "nomer" in img_file_lower or "номер" in img_file_lower) and
-                          not ("marka" in img_file_lower or "марка" in img_file_lower)):
-                        if 3 not in field_images:
-                            field_images[3] = []
-                        field_images[3].append(rel_path)
-                        print(f"[process_zip_file] Added to field_images[3]: {img_file}")
-            
-            print(f"[process_zip_file] Final field_images keys: {list(field_images.keys())}")
-        
+        print(
+            f"[process_zip_file] field_images (type1): ключи {list(field_images.keys())}, "
+            f"файлов: {sum(len(v) for v in field_images.values())}"
+        )
+
         row_data = {
             1: user_date_str,
             2: car_val,
@@ -1088,6 +2143,11 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
             15: None, 16: None,
             17: "",
             18: filtered_debug_str if not is_xlsx else "",
+            "plate_groups": plate_groups,
+            "plate_format_warning": bool(plate_format_warning),
+            "plate_retry_failed": bool(plate_retry_failed),
+            "raw_groups": raw_groups,
+            "ocr_debug": ocr_debug_merged,
             'preview_images': preview_image_paths,
             'field_images': field_images,
             'sources': source_map,
@@ -1113,35 +2173,40 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
             # print(f"[process_zip_file] Searching for ESF/SNT files with surname variants: {surname_variants}")
             
             for t2_path in type_2_files:
-                fname = os.path.basename(t2_path).lower()
-                
+                if t2_path in used_type_2:
+                    continue
+                fname_surname = extract_surname_from_filename(t2_path)
                 match_found = False
-                # 1. Exact match
-                for variant in surname_variants:
-                    if variant.lower() in fname:
-                        match_found = True
-                        print(f" [MATCH] Exact match found Type 2: {t2_path}")
-                        break
                 
-                # 2. Fuzzy match
-                if not match_found:
-                    fname_words = re.findall(r'\w+', fname)
+                if fname_surname:
                     for variant in surname_variants:
-                        v_lower = variant.lower()
-                        for word in fname_words:
-                            ratio = difflib.SequenceMatcher(None, v_lower, word).ratio()
-                            if ratio > 0.80: # Threshold 80%
-                                match_found = True
-                                print(f" [MATCH] Fuzzy match ({ratio:.2f}) found Type 2: {t2_path} (variant: {variant}, word: {word})")
-                                break
-                        if match_found: break
+                        ratio = difflib.SequenceMatcher(None, variant.lower(), fname_surname.lower()).ratio()
+                        if ratio >= 0.60:
+                            match_found = True
+                            print(f" [MATCH] 60%+ similarity match found Type 2: {t2_path} (variant: {variant}, fname_surname: {fname_surname}, ratio: {ratio:.2f})")
+                            row_data[4] = fname_surname
+                            break
+                    if match_found:
+                        pass
                 
                 if match_found:
                     print(f" Match confirmed for Type 2: {t2_path}")
                     t2_preview_dir = os.path.join(preview_obj_dir, "type2")
                     os.makedirs(t2_preview_dir, exist_ok=True)
                     
-                    t2_data = extract_text_from_pdf(t2_path, type_2_map, t2_preview_dir)
+                    t2_data = extract_text_from_pdf(
+                        t2_path,
+                        type_2_map,
+                        t2_preview_dir,
+                        timing_collector=timing_collector,
+                        preview_workspace_root=base_temp_dir,
+                    )
+                    _merge_preview_paths_from_extract(field_images, t2_data)
+                    try:
+                        if isinstance(t2_data.get("ocr_debug"), dict):
+                            ocr_debug_merged.update(t2_data["ocr_debug"])
+                    except Exception:
+                        pass
                     
                     price_raw = t2_data.get("Цена (8)")
                     price_val_str = DataCleaner.clean_8(price_raw, context)
@@ -1150,7 +2215,15 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                     
                     if check_price == Decimal("7") or check_price <= Decimal("1"):
                         print(f" [Price Check] Price is {check_price}, checking 2nd page of ESF...")
-                        t2_data_p2 = extract_text_from_pdf(t2_path, type_2_page_2_map, t2_preview_dir, page_num=1)
+                        t2_data_p2 = extract_text_from_pdf(
+                            t2_path,
+                            type_2_page_2_map,
+                            t2_preview_dir,
+                            page_num=1,
+                            timing_collector=timing_collector,
+                            preview_workspace_root=base_temp_dir,
+                        )
+                        _merge_preview_paths_from_extract(field_images, t2_data_p2)
                         price_alt_raw = t2_data_p2.get("Цена (8) Alt")
                         if price_alt_raw:
                             print(f" [Price Check] Found price on 2nd page: {price_alt_raw}")
@@ -1162,38 +2235,42 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                     row_data[16] = DataCleaner.clean_16(t2_data.get("№ счет факт (Инвойс) (16)"), context)
                     
                     if os.path.exists(t2_preview_dir):
-                        print(f"[process_zip_file] Scanning t2_preview_dir: {t2_preview_dir}")
-                        for img_file in os.listdir(t2_preview_dir):
+                        t2_files = [f for f in os.listdir(t2_preview_dir) if os.path.isfile(os.path.join(t2_preview_dir, f))]
+                        print(f"[process_zip_file] t2_preview_dir: {len(t2_files)} файлов")
+                        for img_file in t2_files:
                             img_path = os.path.join(t2_preview_dir, img_file)
                             if os.path.isfile(img_path):
-                                rel_path = os.path.relpath(img_path, settings.MEDIA_ROOT)
-                                rel_path = rel_path.replace("\\", "/")
+                                rel_path = _preview_relpath(img_path, base_temp_dir)
                                 preview_image_paths.append(rel_path)
                                 
                                 img_file_lower = img_file.lower()
-                                print(f"[process_zip_file] Checking t2 file: {img_file}")
                                 
-                                has_16 = ("_16" in img_file_lower or "(16)" in img_file or "16.png" in img_file_lower or
-                                          "schet" in img_file_lower or "счет" in img_file_lower or 
-                                          "fakt" in img_file_lower or "факт" in img_file_lower or
-                                          "invoice" in img_file_lower or "инвойс" in img_file_lower or
-                                          "invois" in img_file_lower)
+                                # Важно: не используем общие ключевые слова типа "schet/faktura",
+                                # т.к. они часто встречаются в базовом имени PDF и могут попасть
+                                # в filenames для ПАРА (цена/инвойс) и перепутать классификацию.
+                                # Опираться будем в основном на маркеры поля: "_16" / "(16)" / "16.png".
+                                has_16 = (
+                                    "_16" in img_file_lower
+                                    or "(16)" in img_file_lower
+                                    or "16.png" in img_file_lower
+                                    or "_16_" in img_file_lower
+                                )
                                 
-                                has_8 = ("_8" in img_file_lower or "(8)" in img_file or 
-                                         "8.png" in img_file_lower or "_8_" in img_file_lower or 
-                                         ("cena" in img_file_lower or "цена" in img_file_lower or 
-                                          "price" in img_file_lower or "tsena" in img_file_lower))
+                                has_8 = (
+                                    "_8" in img_file_lower
+                                    or "(8)" in img_file_lower
+                                    or "8.png" in img_file_lower
+                                    or "_8_" in img_file_lower
+                                    or ("cena" in img_file_lower or "цена" in img_file_lower or
+                                        "price" in img_file_lower or "tsena" in img_file_lower)
+                                )
                                 
-                                if has_16:
-                                    if 16 not in field_images:
-                                        field_images[16] = []
-                                    field_images[16].append(rel_path)
-                                    print(f"[process_zip_file] Added to field_images[16]: {img_file}")
-                                elif has_8 or not has_16:
-                                    if 8 not in field_images:
-                                        field_images[8] = []
-                                    field_images[8].append(rel_path)
-                                    print(f"[process_zip_file] Added to field_images[8]: {img_file}")
+                                if has_8:
+                                    field_images.setdefault("8", []).append(rel_path)
+                                elif has_16:
+                                    pass
+                                else:
+                                    field_images.setdefault("8", []).append(rel_path)
                     
                     if save_photos:
                         os.makedirs(person_img_dir, exist_ok=True)
@@ -1213,54 +2290,52 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                 print(f"[process_zip_file] Warning: no Type2 (ЭСФ) match for surname {surname_clean} in object {len(final_results)}")
             
             for t3_path in type_3_files:
-                fname = os.path.basename(t3_path).lower()
-                
+                if t3_path in used_type_3:
+                    continue
+                fname_surname = extract_surname_from_filename(t3_path)
                 match_found = False
-                # 1. Exact match
-                for variant in surname_variants:
-                    if variant.lower() in fname:
-                        match_found = True
-                        print(f" [MATCH] Exact match found Type 3: {t3_path}")
-                        break
                 
-                # 2. Fuzzy match
-                if not match_found:
-                    fname_words = re.findall(r'\w+', fname)
+                if fname_surname:
                     for variant in surname_variants:
-                        v_lower = variant.lower()
-                        for word in fname_words:
-                            ratio = difflib.SequenceMatcher(None, v_lower, word).ratio()
-                            if ratio > 0.80: # Threshold 80%
-                                match_found = True
-                                print(f" [MATCH] Fuzzy match ({ratio:.2f}) found Type 3: {t3_path} (variant: {variant}, word: {word})")
-                                break
-                        if match_found: break
+                        ratio = difflib.SequenceMatcher(None, variant.lower(), fname_surname.lower()).ratio()
+                        if ratio >= 0.60:
+                            match_found = True
+                            print(f" [MATCH] 60%+ similarity match found Type 3: {t3_path} (variant: {variant}, fname_surname: {fname_surname}, ratio: {ratio:.2f})")
+                            row_data[4] = fname_surname
+                            break
+                    if match_found:
+                        pass
 
                 if match_found:
                     print(f" Match confirmed for Type 3: {t3_path}")
                     t3_preview_dir = os.path.join(preview_obj_dir, "type3")
                     os.makedirs(t3_preview_dir, exist_ok=True)
                     
-                    t3_data = extract_text_from_pdf(t3_path, type_3_map, t3_preview_dir)
+                    t3_data = extract_text_from_pdf(
+                        t3_path, type_3_map, t3_preview_dir, timing_collector=timing_collector
+                    )
+                    try:
+                        if isinstance(t3_data.get("ocr_debug"), dict):
+                            ocr_debug_merged.update(t3_data["ocr_debug"])
+                    except Exception:
+                        pass
                     row_data[15] = DataCleaner.clean_15(t3_data.get("№ сопров.накл. KZ (15)"), context)
                     
                     date_sopr = DataCleaner.clean_1(t3_data.get("Дата сопр.накл (13)"), context)
                     row_data[13] = date_sopr
                         
                     if os.path.exists(t3_preview_dir):
-                        print(f"[process_zip_file] Scanning t3_preview_dir: {t3_preview_dir}")
                         t3_files_list = []
                         for img_file in os.listdir(t3_preview_dir):
                             img_path = os.path.join(t3_preview_dir, img_file)
-                            if os.path.isfile(img_path) and img_file.lower().endswith('.png'):
-                                rel_path = os.path.relpath(img_path, settings.MEDIA_ROOT)
-                                rel_path = rel_path.replace("\\", "/")
+                            if os.path.isfile(img_path) and img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                rel_path = _preview_relpath(img_path, base_temp_dir)
                                 preview_image_paths.append(rel_path)
                                 t3_files_list.append((img_file, rel_path))
+                        print(f"[process_zip_file] t3_preview_dir: {len(t3_files_list)} png")
                         
                         for img_file, rel_path in t3_files_list:
                             img_file_lower = img_file.lower()
-                            print(f"[process_zip_file] Checking t3 file: {img_file}")
                             
                             has_kz_15 = ("kz" in img_file_lower or "_15" in img_file_lower or "(15)" in img_file or 
                                             "15.png" in img_file_lower or "_15_" in img_file_lower or
@@ -1277,34 +2352,28 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                                 if 15 not in field_images:
                                     field_images[15] = []
                                 field_images[15].append(rel_path)
-                                print(f"[process_zip_file] Added to field_images[15]: {img_file}")
                             elif (has_13 or (has_date_keyword and has_sopr_nakl)) and not has_kz_15:
                                 if 13 not in field_images:
                                     field_images[13] = []
                                 field_images[13].append(rel_path)
-                                print(f"[process_zip_file] Added to field_images[13]: {img_file}")
                             elif 13 not in field_images and 15 not in field_images:
                                 file_index = [i for i, (f, _) in enumerate(t3_files_list) if f == img_file][0]
                                 if file_index == 0:
                                     if 15 not in field_images:
                                         field_images[15] = []
                                     field_images[15].append(rel_path)
-                                    print(f"[process_zip_file] Added to field_images[15] by order (first): {img_file}")
                                 else:
                                     if 13 not in field_images:
                                         field_images[13] = []
                                     field_images[13].append(rel_path)
-                                    print(f"[process_zip_file] Added to field_images[13] by order (second): {img_file}")
                             elif 15 in field_images and 13 not in field_images:
                                 if 13 not in field_images:
                                     field_images[13] = []
                                 field_images[13].append(rel_path)
-                                print(f"[process_zip_file] Added to field_images[13] (15 already filled): {img_file}")
                             elif 13 in field_images and 15 not in field_images:
                                 if 15 not in field_images:
                                     field_images[15] = []
                                 field_images[15].append(rel_path)
-                                print(f"[process_zip_file] Added to field_images[15] (13 already filled): {img_file}")
                     
                     if save_photos:
                         os.makedirs(person_img_dir, exist_ok=True)
@@ -1376,6 +2445,11 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
         leftover_t2 = list(set(type_2_files) - used_type_2)[0]
         leftover_t3 = list(set(type_3_files) - used_type_3)[0]
         
+        force_surname = extract_surname_from_filename(leftover_t2) or extract_surname_from_filename(leftover_t3)
+        if force_surname:
+            row_data[4] = force_surname
+            print(f"[Force Match] Updated driver name to matched surname: {force_surname}")
+        
         print(f"[Force Match] Force linking ESF: {os.path.basename(leftover_t2)}")
         print(f"[Force Match] Force linking SNT: {os.path.basename(leftover_t3)}")
         
@@ -1402,7 +2476,14 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
         os.makedirs(t3_preview_dir, exist_ok=True)
 
         # 1. Extract ESF (Type 2)
-        t2_data = extract_text_from_pdf(leftover_t2, type_2_map, t2_preview_dir)
+        t2_data = extract_text_from_pdf(
+            leftover_t2,
+            type_2_map,
+            t2_preview_dir,
+            timing_collector=timing_collector,
+            preview_workspace_root=base_temp_dir,
+        )
+        _merge_preview_paths_from_extract(row_data["field_images"], t2_data)
         
         price_raw = t2_data.get("Цена (8)")
         price_val_str = DataCleaner.clean_8(price_raw, context)
@@ -1410,7 +2491,15 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
         
         if check_price == Decimal("7") or check_price <= Decimal("1"):
             print(f" [Force Match] checking 2nd page of ESF... (Price={check_price})")
-            t2_data_p2 = extract_text_from_pdf(leftover_t2, type_2_page_2_map, t2_preview_dir, page_num=1)
+            t2_data_p2 = extract_text_from_pdf(
+                leftover_t2,
+                type_2_page_2_map,
+                t2_preview_dir,
+                page_num=1,
+                timing_collector=timing_collector,
+                preview_workspace_root=base_temp_dir,
+            )
+            _merge_preview_paths_from_extract(row_data["field_images"], t2_data_p2)
             price_alt_raw = t2_data_p2.get("Цена (8) Alt")
             if price_alt_raw:
                 t2_data["Цена (8)"] = price_alt_raw
@@ -1420,7 +2509,9 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
         used_type_2.add(leftover_t2)
 
         # 2. Extract SNT (Type 3)
-        t3_data = extract_text_from_pdf(leftover_t3, type_3_map, t3_preview_dir)
+        t3_data = extract_text_from_pdf(
+            leftover_t3, type_3_map, t3_preview_dir, timing_collector=timing_collector
+        )
         row_data[15] = DataCleaner.clean_15(t3_data.get("№ сопров.накл. KZ (15)"), context)
         date_sopr = DataCleaner.clean_1(t3_data.get("Дата сопр.накл (13)"), context)
         row_data[13] = date_sopr
@@ -1432,16 +2523,22 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
                 for img_file in os.listdir(scan_dir):
                     img_path = os.path.join(scan_dir, img_file)
                     if os.path.isfile(img_path):
-                        rel_path = os.path.relpath(img_path, settings.MEDIA_ROOT).replace("\\", "/")
+                        rel_path = _preview_relpath(img_path, base_temp_dir)
                         r_data['preview_images'].append(rel_path)
                         
                         img_lower = img_file.lower()
-                        has_16 = ("_16" in img_lower or "(16)" in img_lower or "schet" in img_lower or "invoice" in img_lower)
-                        has_8 = ("_8" in img_lower or "(8)" in img_lower or "cena" in img_lower or "price" in img_lower)
+                        # Здесь тоже не используем общие ключевые слова (schet/invoice),
+                        # чтобы не перепутать цену и инвойс из-за base имени PDF.
+                        has_16 = ("_16" in img_lower or "(16)" in img_lower or "16.png" in img_lower or "_16_" in img_lower)
+                        has_8 = ("_8" in img_lower or "(8)" in img_lower or "8.png" in img_lower or "_8_" in img_lower or
+                                  ("cena" in img_lower or "price" in img_lower or "tsena" in img_lower))
                         if has_16:
                              if 16 not in r_data['field_images']: r_data['field_images'][16] = []
                              r_data['field_images'][16].append(rel_path)
                         elif has_8:
+                             if 8 not in r_data['field_images']: r_data['field_images'][8] = []
+                             r_data['field_images'][8].append(rel_path)
+                        else:
                              if 8 not in r_data['field_images']: r_data['field_images'][8] = []
                              r_data['field_images'][8].append(rel_path)
                         
@@ -1546,7 +2643,9 @@ def process_zip_file(zip_file, dollar_rate, selected_date, tn_ved_code, bnd_code
 
         raise Exception(error_msg)
 
-    return final_results
+    _cleanup_ocr_processing_artifacts(base_temp_dir)
+    timing_collector.print_all(overall_seconds=perf_counter() - process_total_start)
+    return final_results, base_temp_dir
 
 
 def generate_excel(data, existing_excel_file=None, nds_percent=2):

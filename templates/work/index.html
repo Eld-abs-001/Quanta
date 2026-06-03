@@ -249,7 +249,7 @@
             margin-bottom: 1.5rem;
             padding: 0.5rem 0;
             color: var(--text-color);
-            display: none;
+            /* display: none; */
         }
 
         .checkbox-wrapper input[type="checkbox"] {
@@ -426,6 +426,7 @@
                 </div>
 
                 <label class="checkbox-wrapper" for="{{ form.save_photos.id_for_label }}">
+                    <!-- Сохранить фотографии (в media/imgs) -->
                     {{ form.save_photos }}
                     <span>Сохранить фотографии (в media/imgs)</span>
                 </label>

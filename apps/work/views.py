@@ -1,5 +1,8 @@
 import os
 import shutil
+import tempfile
+import mimetypes
+from django.http import FileResponse, Http404
 from decimal import Decimal, ROUND_HALF_UP
 from django.shortcuts import render, redirect
 from django.http import HttpResponse
@@ -7,7 +10,14 @@ from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from django.conf import settings
 from .forms import UploadFileForm, PreviewEditForm
-from .services import get_current_dollar_rate, process_zip_file, generate_excel, NetworkError
+from .services import (
+    get_current_dollar_rate,
+    process_zip_file,
+    generate_excel,
+    NetworkError,
+    cleanup_preview_workspace,
+    PREVIEW_PHOTO_FIELD_KEYS,
+)
 
 @login_required
 def upload_view(request):
@@ -53,9 +63,13 @@ def upload_view(request):
                     'save_photos': save_photos
                 }
                 
+                old_preview = request.session.get('preview_data') or {}
+                cleanup_preview_workspace(old_preview.get('preview_workspace'))
+
+                preview_workspace = None
                 try:
                     print(f"[upload_view] Calling process_zip_file with file={getattr(request.FILES['file'], 'name', None)}")
-                    results = process_zip_file(
+                    results, preview_workspace = process_zip_file(
                         request.FILES['file'],
                         dollar_rate=dollar_rate,
                         selected_date=date,
@@ -66,6 +80,7 @@ def upload_view(request):
                     )
                     print(f"[upload_view] process_zip_file returned {len(results)} result(s)")
                 except Exception as e:
+                    cleanup_preview_workspace(preview_workspace)
                     error_message = str(e)
                     print(f"[upload_view] Error processing zip file: {error_message}")
                     messages.error(request, f'Ошибка при обработке файла: {error_message}')
@@ -80,15 +95,16 @@ def upload_view(request):
                             messages.error(request, f"{driver_name}: {error}")
                 
                 if has_critical_errors:
+                    cleanup_preview_workspace(preview_workspace)
                     return render(request, 'work/index.html', {'form': form})
                 
                 existing_excel_path = None
                 if existing_excel:
-                    base_temp_dir = os.path.join(settings.MEDIA_ROOT, "temp_ocr")
-                    existing_excel_dir = os.path.join(base_temp_dir, "existing_excel")
-                    os.makedirs(existing_excel_dir, exist_ok=True)
-                    existing_excel_path = os.path.join(existing_excel_dir, existing_excel.name)
-                    with open(existing_excel_path, 'wb+') as destination:
+                    fd, existing_excel_path = tempfile.mkstemp(
+                        suffix=".xlsx", prefix="quanta_existing_"
+                    )
+                    os.close(fd)
+                    with open(existing_excel_path, 'wb') as destination:
                         for chunk in existing_excel.chunks():
                             destination.write(chunk)
                 
@@ -117,7 +133,8 @@ def upload_view(request):
                     'bnd_code': bnd_code,
                     'nds_percent': str(nds_percent),
                     'existing_excel_path': existing_excel_path,
-                    'save_photos': save_photos
+                    'save_photos': save_photos,
+                    'preview_workspace': preview_workspace,
                 }
                 
                 return redirect('preview')
@@ -148,16 +165,18 @@ def preview_view(request):
         return redirect('upload')
     
     results = preview_data['results']
+    preview_workspace = preview_data.get('preview_workspace') or ''
     
     form = PreviewEditForm(objects_data=results)
     
     objects_for_template = []
+    plate_warnings = []
     for idx, row in enumerate(results):
         image_paths = row.get('preview_images', [])
         valid_images = []
         for img_path in image_paths:
-            full_path = os.path.join(settings.MEDIA_ROOT, img_path)
-            if os.path.exists(full_path):
+            full_path = os.path.join(preview_workspace, img_path) if preview_workspace else ''
+            if full_path and os.path.exists(full_path):
                 valid_images.append(img_path)
         
         data_dict = {}
@@ -172,13 +191,19 @@ def preview_view(request):
                     for field_key_str, img_list in value.items():
                         try:
                             field_key = int(field_key_str)
+                            if field_key not in PREVIEW_PHOTO_FIELD_KEYS:
+                                continue
                             valid_field_images = []
                             for img_path in img_list:
-                                full_path = os.path.join(settings.MEDIA_ROOT, img_path)
-                                if os.path.exists(full_path):
+                                full_path = (
+                                    os.path.join(preview_workspace, img_path)
+                                    if preview_workspace
+                                    else ''
+                                )
+                                if full_path and os.path.exists(full_path):
                                     valid_field_images.append(img_path)
                             if valid_field_images:
-                                field_images_dict[field_key] = valid_field_images
+                                field_images_dict[str(field_key)] = valid_field_images
                         except (ValueError, TypeError):
                             pass
                 continue
@@ -206,6 +231,25 @@ def preview_view(request):
             'sources': sources_dict,
             'errors': row.get('errors', [])
         }
+        # Удобные ключи для шаблона (без доступа к dict по числовому ключу через точку)
+        obj['img_1'] = field_images_dict.get('1', [])
+        obj['img_2'] = field_images_dict.get('2', [])
+        obj['img_3'] = field_images_dict.get('3', [])
+        obj['img_4'] = field_images_dict.get('4', [])
+        obj['img_7'] = field_images_dict.get('7', [])
+        obj['img_8'] = field_images_dict.get('8', [])
+        try:
+            if data_dict.get("plate_format_warning"):
+                plate_warnings.append(
+                    {
+                        "idx": idx,
+                        "plate": data_dict.get(3) or "",
+                        "fio": data_dict.get(4) or "",
+                        "retry_failed": bool(data_dict.get("plate_retry_failed")),
+                    }
+                )
+        except Exception:
+            pass
         date_iso = ""
         date_raw = data_dict.get(1)
         if date_raw:
@@ -224,10 +268,31 @@ def preview_view(request):
     context = {
         'form': form,
         'objects': objects_for_template,
-        'media_url': settings.MEDIA_URL
+        'plate_warnings': plate_warnings,
     }
     
     return render(request, 'work/preview.html', context)
+
+
+@login_required
+def preview_media_view(request, relpath):
+    """Отдаёт кропы предпросмотра из временной папки (не из media/)."""
+    preview_data = request.session.get('preview_data') or {}
+    workspace = preview_data.get('preview_workspace')
+    if not workspace or not os.path.isdir(workspace):
+        raise Http404
+
+    safe_root = os.path.realpath(workspace)
+    safe_path = os.path.realpath(os.path.join(workspace, relpath))
+    if not safe_path.startswith(safe_root):
+        raise Http404
+    if not os.path.isfile(safe_path):
+        raise Http404
+
+    content_type, _ = mimetypes.guess_type(safe_path)
+    if not content_type or not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+    return FileResponse(open(safe_path, "rb"), content_type=content_type)
 
 @login_required
 def preview_submit_view(request):
@@ -478,22 +543,14 @@ def preview_submit_view(request):
             
             wb = generate_excel(excel_data, existing_excel, nds_percent=nds_percent)
             
-            save_photos = preview_data.get('save_photos', False)
-            base_temp_dir = os.path.join(settings.MEDIA_ROOT, "temp_ocr")
-            preview_imgs_dir = os.path.join(base_temp_dir, "preview_imgs")
-            
-            if save_photos:
-                if os.path.exists(preview_imgs_dir):
-                    shutil.rmtree(preview_imgs_dir)
-                if os.path.exists(base_temp_dir):
-                    for item in ['upload', 'extracted', 'existing_excel']:
-                        item_path = os.path.join(base_temp_dir, item)
-                        if os.path.exists(item_path):
-                            shutil.rmtree(item_path)
-            else:
-                if os.path.exists(base_temp_dir):
-                    shutil.rmtree(base_temp_dir)
-            
+            cleanup_preview_workspace(preview_data.get('preview_workspace'))
+            existing_excel_path = preview_data.get('existing_excel_path')
+            if existing_excel_path and os.path.isfile(existing_excel_path):
+                try:
+                    os.remove(existing_excel_path)
+                except OSError:
+                    pass
+
             if 'preview_data' in request.session:
                 del request.session['preview_data']
             
